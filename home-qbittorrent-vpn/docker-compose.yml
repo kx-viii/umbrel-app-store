@@ -11,6 +11,23 @@ services:
 
   gluetun:
     image: qmcgaw/gluetun:v3.41.3
+    # The key can only be added in Umbrel after install, so without it gluetun stays up
+    # (letting the install succeed) but blocks all outgoing traffic instead of exiting
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ -z "$${WIREGUARD_PRIVATE_KEY}" ]; then
+          echo "WIREGUARD_PRIVATE_KEY is not set: add it in Umbrel > app Settings > Advanced > Custom variables (service: gluetun). All outgoing traffic is blocked until then."
+          iptables -P OUTPUT DROP || exit 1
+          iptables -P FORWARD DROP || exit 1
+          iptables -A OUTPUT -o lo -j ACCEPT || exit 1
+          ip6tables -P OUTPUT DROP 2>/dev/null
+          ip6tables -P FORWARD DROP 2>/dev/null
+          ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null
+          while true; do sleep 3600; done
+        fi
+        exec /gluetun-entrypoint
     cap_add:
       - NET_ADMIN
     devices:
@@ -31,11 +48,10 @@ services:
 
   server:
     image: ghcr.io/hotio/qbittorrent:release-5.2.3@sha256:251f7c1561294a9efb5aaafff50adf82952a2975f35dbb2bb519790d5068bcfb
-    # All qBittorrent traffic goes through the VPN; if the VPN is down it has no network at all
+    # All qBittorrent traffic goes through gluetun, whose firewall only lets VPN traffic out
     network_mode: "service:gluetun"
     depends_on:
-      gluetun:
-        condition: service_healthy
+      - gluetun
     environment:
       - PUID=1000
       - PGID=1000
