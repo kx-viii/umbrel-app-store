@@ -1,0 +1,45 @@
+manifestVersion: 1.1
+id: home-qbittorrent-vpn
+category: networking
+name: qBittorrent VPN
+version: "5.2.3"
+tagline: qBittorrent that only downloads through Proton VPN
+icon: https://getumbrel.github.io/umbrel-apps-gallery/qbittorrent/icon.svg
+description: >-
+  qBittorrent running inside Gluetun, connected to Proton VPN over WireGuard.
+  qBittorrent has no network access except through the VPN, so if the VPN drops
+  your torrents stop instead of falling back to your home IP.
+  Proton's forwarded port is applied to qBittorrent automatically.
+
+
+  🛠️ SET-UP INSTRUCTIONS
+
+
+  1. Right-click the app > Settings > Advanced > Custom variables.
+  Add WIREGUARD_PRIVATE_KEY for the gluetun service, with the PrivateKey from your
+  Proton WireGuard config (generated with NAT-PMP / Port Forwarding turned on). Save.
+
+  2. Open the app, log in with admin / adminadmin and change the password
+  under Tools > Options > WebUI.
+
+  3. In the same WebUI tab, tick "Bypass authentication for clients on localhost"
+  so the forwarded VPN port can be applied automatically.
+
+  4. In Radarr and Sonarr, add a qBittorrent download client with host
+  home-qbittorrent-vpn_gluetun_1 and port 8080.
+releaseNotes: ""
+developer: qBittorrent / Gluetun
+website: https://qbittorrent.org/
+dependencies: []
+repo: https://github.com/qdm12/gluetun
+support: https://github.com/qdm12/gluetun-wiki
+port: 8478
+gallery: []
+path: ""
+defaultUsername: "admin"
+defaultPassword: "adminadmin"
+torOnly: false
+permissions:
+  - STORAGE_DOWNLOADS
+submitter: home
+submission: ""
