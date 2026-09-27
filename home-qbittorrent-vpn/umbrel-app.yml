@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: home-qbittorrent-vpn
 category: networking
 name: qBittorrent VPN
-version: "5.2.3-patch.1"
+version: "5.2.3-patch.2"
 tagline: qBittorrent that only downloads through Proton VPN
 icon: https://getumbrel.github.io/umbrel-apps-gallery/qbittorrent/icon.svg
 description: >-
@@ -24,7 +24,7 @@ description: >-
 
   3. In Radarr and Sonarr, add a qBittorrent download client with host
   home-qbittorrent-vpn_gluetun_1 and port 8080 (no username or password needed).
-releaseNotes: "Fixes the Unauthorized page behind the Umbrel proxy, sets the default adminadmin password, and lets gluetun apply the VPN forwarded port automatically."
+releaseNotes: "Adds an HTTP proxy (port 8888) so apps like Prowlarr can send their traffic through the VPN."
 developer: qBittorrent / Gluetun
 website: https://qbittorrent.org/
 dependencies: []
