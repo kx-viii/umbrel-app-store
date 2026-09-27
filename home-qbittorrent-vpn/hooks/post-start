@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Adapted from the official Umbrel qBittorrent app's post-start hook. On first run it:
+# - disables Host header validation and trusts the Umbrel proxy, so the web UI loads behind Umbrel
+# - sets the default password to 'adminadmin' (qBittorrent otherwise only prints a temporary one to the logs)
+# - lets apps on the Umbrel network (Radarr, Sonarr, Prowlarr) connect without a password
+# - lets localhost connect without a password, so gluetun can set the VPN's forwarded port
+# A flag file makes sure user changes to qBittorrent.conf are never overwritten afterwards.
+
+APP_DATA_DIR="$(readlink -f "$(dirname "${BASH_SOURCE[0]}")/..")"
+QBITTORRENT_CONF_FILE="${APP_DATA_DIR}/data/config/config/qBittorrent.conf"
+CONFIGURED_FLAG="${APP_DATA_DIR}/HAS_BEEN_CONFIGURED"
+
+if [[ -f "${CONFIGURED_FLAG}" ]]; then
+  echo "qBittorrent has already been configured."
+  exit
+fi
+
+echo "Waiting up to 30 seconds for qBittorrent.conf to exist..."
+for attempt in $(seq 1 300); do
+  [[ -f "${QBITTORRENT_CONF_FILE}" ]] && break
+  sleep 0.1
+done
+
+if [[ ! -f "${QBITTORRENT_CONF_FILE}" ]]; then
+  echo "qBittorrent.conf was never created. Something is likely wrong with the qBittorrent app."
+  exit
+fi
+
+# Give qBittorrent time to finish writing the file before stopping it
+sleep 5
+
+"${UMBREL_ROOT}/scripts/app" compose "${APP_ID}" stop server || true
+
+ensure_section() {
+  if ! grep --quiet "^\[$1\]$" "${QBITTORRENT_CONF_FILE}"; then
+    printf '\n[%s]\n' "$1" >> "${QBITTORRENT_CONF_FILE}"
+  fi
+}
+
+# set_key <section> <key> <value>: replaces the key if present, otherwise adds it under the section
+set_key() {
+  local -r section="$1" key="$2" value="$3"
+  local -r escaped_key="${key//\\/\\\\}"
+  if grep -q "^${escaped_key}=" "${QBITTORRENT_CONF_FILE}"; then
+    sed -i "s|^${escaped_key}=.*|${escaped_key}=${value}|" "${QBITTORRENT_CONF_FILE}"
+  else
+    sed -i "/^\[${section}\]/a ${escaped_key}=${value}" "${QBITTORRENT_CONF_FILE}"
+  fi
+}
+
+ensure_section BitTorrent
+ensure_section Preferences
+
+set_key BitTorrent 'Session\DefaultSavePath' '/downloads'
+set_key Preferences 'WebUI\HostHeaderValidation' 'false'
+set_key Preferences 'WebUI\ReverseProxySupportEnabled' 'true'
+set_key Preferences 'WebUI\TrustedReverseProxiesList' '10.21.0.0/16'
+set_key Preferences 'WebUI\AuthSubnetWhitelistEnabled' 'true'
+set_key Preferences 'WebUI\AuthSubnetWhitelist' '10.21.0.0/16'
+set_key Preferences 'WebUI\LocalHostAuth' 'false'
+
+if ! grep --quiet '^WebUI\\Password_PBKDF2' "${QBITTORRENT_CONF_FILE}"; then
+  echo "Setting default password adminadmin"
+  set_key Preferences 'WebUI\Password_PBKDF2' '"@ByteArray(gTzqQHUv3A1X43tLaAhaJQ==:ZBCIBA4honNZ7H66xdEoHpqBC/Vvwj17ZCjQKARSK78ScJWDMdWSfxezHG536UekAL/zpRn571MXCfhtdqiArA==)"'
+fi
+
+touch "${CONFIGURED_FLAG}"
+
+echo "Starting qBittorrent..."
+"${UMBREL_ROOT}/scripts/app" compose "${APP_ID}" start server

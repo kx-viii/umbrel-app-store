@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: home-qbittorrent-vpn
 category: networking
 name: qBittorrent VPN
-version: "5.2.3"
+version: "5.2.3-patch.1"
 tagline: qBittorrent that only downloads through Proton VPN
 icon: https://getumbrel.github.io/umbrel-apps-gallery/qbittorrent/icon.svg
 description: >-
@@ -22,12 +22,9 @@ description: >-
   2. Open the app, log in with admin / adminadmin and change the password
   under Tools > Options > WebUI.
 
-  3. In the same WebUI tab, tick "Bypass authentication for clients on localhost"
-  so the forwarded VPN port can be applied automatically.
-
-  4. In Radarr and Sonarr, add a qBittorrent download client with host
-  home-qbittorrent-vpn_gluetun_1 and port 8080.
-releaseNotes: ""
+  3. In Radarr and Sonarr, add a qBittorrent download client with host
+  home-qbittorrent-vpn_gluetun_1 and port 8080 (no username or password needed).
+releaseNotes: "Fixes the Unauthorized page behind the Umbrel proxy, sets the default adminadmin password, and lets gluetun apply the VPN forwarded port automatically."
 developer: qBittorrent / Gluetun
 website: https://qbittorrent.org/
 dependencies: []

@@ -17,12 +17,12 @@ qBittorrent shares Gluetun's network, so it has no internet access at all when t
 4. **Add the key:** right-click the app > Settings > Advanced > Custom variables, add
    `WIREGUARD_PRIVATE_KEY` for the `gluetun` service. Optionally add `SERVER_COUNTRIES` (e.g. `United States`). Save.
    Never commit the key to this repo.
-5. **qBittorrent web UI** (login `admin` / `adminadmin`): Tools > Options > WebUI
-   - change the password
-   - tick **Bypass authentication for clients on localhost** (lets Gluetun set the forwarded port)
-   - Downloads tab: default save path stays `/downloads`
+5. **qBittorrent web UI** (login `admin` / `adminadmin`): change the password under Tools > Options > WebUI.
+   On first start, `hooks/post-start` configures qBittorrent for the Umbrel proxy, allows localhost
+   (so Gluetun can set the forwarded port) and the Umbrel app network (Radarr/Sonarr) without a password,
+   and keeps the save path at `/downloads`.
 6. **Radarr and Sonarr:** Settings > Download Clients > add qBittorrent, host `home-qbittorrent-vpn_gluetun_1`,
-   port `8080`, with your new qBittorrent username/password. Remove the old Transmission/qBittorrent clients.
+   port `8080`, no username/password. Remove the old Transmission/qBittorrent clients.
 
 ### Check it's working
 
