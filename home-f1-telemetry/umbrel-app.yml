@@ -1,0 +1,34 @@
+manifestVersion: 1.1
+id: home-f1-telemetry
+category: media
+name: F1 Telemetry
+version: "1.0.0"
+tagline: Live F1 timing, held back to match your TV
+icon: https://raw.githubusercontent.com/kx-viii/f1-telemetry/main/apps/frontend/public/images/512.png
+description: >-
+  Live Formula 1 timing dashboard (timing tower, track map, strategy, race control)
+  fed from F1's official live-timing service.
+  The dashboard can be delayed by up to three minutes to match a TV stream:
+  tap the lap counter when your TV's lap ticks over and it measures the delay for you.
+  The delay is saved per device.
+
+
+  The relay keeps about three minutes of history in memory, so restarting the app
+  mid-session resets the delay buffer.
+
+
+  Open it on a phone and use Share > Add to Home Screen for an app-like icon.
+releaseNotes: ""
+developer: matteocelani
+website: https://github.com/matteocelani/f1-telemetry
+dependencies: []
+repo: https://github.com/kx-viii/f1-telemetry
+support: https://github.com/matteocelani/f1-telemetry/issues
+port: 8482
+gallery: []
+path: "/live"
+defaultUsername: ""
+defaultPassword: ""
+torOnly: false
+submitter: home
+submission: ""
