@@ -10,6 +10,6 @@ services:
 
   relay:
     # Built by GitHub Actions in kx-viii/f1-telemetry; the tag is the source commit
-    image: ghcr.io/kx-viii/f1-telemetry:sha-1997b40
+    image: ghcr.io/kx-viii/f1-telemetry:sha-a267917
     # Serves the dashboard, the WebSocket (/ws) and /health on one port; history is in memory only
     restart: on-failure

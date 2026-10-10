@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: home-f1-telemetry
 category: media
 name: F1 Telemetry
-version: "1.1.0"
+version: "1.2.0"
 tagline: Live F1 timing, held back to match your TV
 icon: https://raw.githubusercontent.com/kx-viii/f1-telemetry/main/apps/frontend/public/images/512.png
 description: >-
@@ -18,7 +18,7 @@ description: >-
 
 
   Open it on a phone and use Share > Add to Home Screen for an app-like icon.
-releaseNotes: "Opens on a home page that shows which session is live and confirms it matches F1's schedule before you enter. The relay now switches to each new session by itself, and the 2026 calendar is corrected (Bahrain and Saudi cancelled, Sepang added, session times fixed)."
+releaseNotes: "Replays of every finished session from F1's archive, with a spoiler-safe race story where tapping a moment replays it on the map, and a 3D track view with chase and onboard cameras."
 developer: matteocelani
 website: https://github.com/matteocelani/f1-telemetry
 dependencies: []
