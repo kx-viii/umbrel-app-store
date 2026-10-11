@@ -112,7 +112,7 @@ Umbrel connects these apps to each other automatically: Prowlarr gets linked to 
 ### Add this app store and install qBittorrent VPN
 
 1. Umbrel **App Store** > **⋯** (top right) > **Community App Stores**. Paste `https://github.com/kx-viii/umbrel-app-store` and select **Add**.
-2. Open the store called **Home Apps** and install **qBittorrent VPN**.
+2. Open the store called **Home Media** and install **qBittorrent VPN**.
 3. Right-click the app's icon > **Settings** > **Advanced** > **Custom variables**. Pick the service **`gluetun`** and add:
    - `WIREGUARD_PRIVATE_KEY` = the `PrivateKey` value from Step 0.
    - Optional: `SERVER_COUNTRIES` = a country name, for example `United Kingdom`.
