@@ -2,7 +2,7 @@
 
 Community app store for umbrelOS.
 
-**Setting up a media server?** Follow [MEDIA-SERVER-SETUP.md](MEDIA-SERVER-SETUP.md). It takes you from a fresh Umbrel to Jellyfin with automatic downloads over a VPN, step by step, and an AI assistant can follow it for you too.
+**Setting up a media server?** Follow [MEDIA-SERVER-SETUP.md](MEDIA-SERVER-SETUP.md). It sets up Jellyfin with automatic downloads over a VPN, step by step, on an Umbrel or on any computer that runs Docker (Linux, Windows, Mac or a NAS). An AI assistant can follow it for you too.
 
 ## qBittorrent VPN
 
