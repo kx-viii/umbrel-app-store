@@ -2,6 +2,8 @@
 
 Community app store for umbrelOS.
 
+**Setting up a media server?** Follow [MEDIA-SERVER-SETUP.md](MEDIA-SERVER-SETUP.md). It takes you from a fresh Umbrel to Jellyfin with automatic downloads over a VPN, step by step, and an AI assistant can follow it for you too.
+
 ## qBittorrent VPN
 
 qBittorrent routed through [Gluetun](https://github.com/qdm12/gluetun) to Proton VPN (WireGuard, port forwarding on).
@@ -35,7 +37,7 @@ number, not 6881. Then add a torrent IP checker, such as the magnet link from
 A Core Keeper dedicated server ([escapingnetwork/core-keeper-dedicated](https://github.com/escapingnetwork/core-keeper-dedicated)).
 Players join over Steam's relay with the Game ID, so no ports are opened on the router.
 
-1. Install "Core Keeper" and open it. The first start downloads the server from Steam (about 1 GB).
+1. Install "Core Keeper" and open it. The first start downloads the server from Steam (about 600 MB).
 2. When the page shows the Game ID, players join in Core Keeper with Play > Join game > Game ID.
 3. The ID is kept in `ServerConfig.json` in the app data, so it stays the same across restarts.
    It's never stored in this repo; anyone with it can join.

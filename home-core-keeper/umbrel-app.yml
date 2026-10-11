@@ -11,7 +11,7 @@ description: >-
   Connections go through Steam's relay, so no router ports need opening and your home IP stays hidden.
 
 
-  The first start downloads the server from Steam (about 1 GB) and takes a few minutes.
+  The first start downloads the server from Steam (about 600 MB) and takes a few minutes.
   The server updates itself from Steam every time it starts, so restart the app after a game update.
 
 
