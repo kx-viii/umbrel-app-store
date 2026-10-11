@@ -1,0 +1,36 @@
+manifestVersion: 1.1
+id: home-core-keeper
+category: gaming
+name: Core Keeper
+version: "1.0.0"
+tagline: Your own Core Keeper world, always online
+icon: https://raw.githubusercontent.com/kx-viii/umbrel-app-store/main/home-core-keeper/icon.png
+description: >-
+  A Core Keeper dedicated server, so your world stays up when the host isn't playing.
+  Players join with the Game ID shown when you open this app (in Core Keeper: Play > Join game > Game ID).
+  Connections go through Steam's relay, so no router ports need opening and your home IP stays hidden.
+
+
+  The first start downloads the server from Steam (about 1 GB) and takes a few minutes.
+  The server updates itself from Steam every time it starts, so restart the app after a game update.
+
+
+  The Game ID works like a password: anyone who has it can join, so only share it with your friends.
+
+
+  Optional custom variables (Settings > Advanced > Custom variables, service "server"):
+  WORLD_NAME, WORLD_MODE (0 Normal, 1 Hard, 2 Creative, 4 Casual; only for a new world), MAX_PLAYERS, WORLD_SEED.
+releaseNotes: ""
+developer: Pugstorm / escapingnetwork
+website: https://corekeeper.game/
+dependencies: []
+repo: https://github.com/escapingnetwork/core-keeper-dedicated
+support: https://github.com/escapingnetwork/core-keeper-dedicated/issues
+port: 8483
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+torOnly: false
+submitter: home
+submission: ""
