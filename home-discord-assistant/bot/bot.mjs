@@ -12,6 +12,8 @@
 //                                          separated by ";" (e.g. 1172470:123456789:Apex Legends)
 //   GAMES_CHAT_ID                          channel that gets a short "new patch notes" heads-up
 //   GAMES_FORUM_ID                         forum whose posts each get a game ping role, picked up by reacting 🔔
+//   STAFF_CHANNEL_ID, STAFF_ROLE_ID        change requests (staff approve with buttons) and admin alerts go here
+//   MONTHLY_BUDGET_USD                     staff are warned at 50%, 80% and 100% of this estimated monthly spend
 //   ROOMS_CATEGORY_ID, MEMBER_ROLE_IDS     game rooms: the category temporary voice rooms go in, and the
 //                                          role ids (comma-separated) allowed to ask for one
 // Run with: npm start
@@ -74,7 +76,7 @@ const REQUESTS_PER_PERSON = 3;      // change requests per person per day
 const REQUESTS_FILE = path.join(here, "requests.json");
 const REQUEST_TOOL = {
   name: "request_change",
-  description: "Send a request to change the server to the staff for approval. Use it when someone asks for something to be added, removed or changed: a game in the games forum, a game's server info (IP, modpack, password, how to join), channels, roles or anything else about the server. Never use it for questions.",
+  description: "Send a request to the staff for approval. Use it when someone asks for something to be added, removed or changed: a game in the games forum, a game's server info (IP, modpack, password, how to join), channels, roles, anything else about the server, or a new feature or change for this bot. Never use it for questions.",
   input_schema: {
     type: "object",
     properties: {
@@ -129,9 +131,9 @@ How to reply:
 // The placeholder only stops the constructor throwing; without a real key the bot never logs in (see the bottom).
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || "missing" });
 const discord = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessageReactions],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.GuildMembers],
   // Partials let reactions on older (uncached) forum posts still come through.
-  partials: [Partials.Message, Partials.Reaction, Partials.User, Partials.Channel],
+  partials: [Partials.Message, Partials.Reaction, Partials.User, Partials.Channel, Partials.GuildMember],
   allowedMentions: { parse: [], repliedUser: true }, // the bot can never mass-ping
 });
 
@@ -142,6 +144,60 @@ let searchSpentToday = 0;             // USD spent today on questions that used 
 let researchedToday = 0;
 const researchByPerson = new Map(); // userId -> researched questions today
 let spentUsd = 0;
+
+// ---- Staff alerts -----------------------------------------------------------
+// Posts admin notices to the staff channel. Each kind of alert (key) is sent at most once per cooldown,
+// so a problem that keeps happening doesn't flood the channel.
+const MONTHLY_BUDGET_USD = Number(process.env.MONTHLY_BUDGET_USD) || 0; // warns at 50%, 80% and 100% of this
+const SPEND_FILE = path.join(here, "spend.json");
+const alertSentAt = new Map();
+async function staffAlert(key, text, cooldownMs = 30 * 60_000) {
+  if (!STAFF_CHANNEL_ID) return;
+  if (Date.now() - (alertSentAt.get(key) ?? 0) < cooldownMs) return;
+  alertSentAt.set(key, Date.now());
+  try {
+    const staff = await discord.channels.fetch(STAFF_CHANNEL_ID);
+    await staff.send({ content: text.slice(0, 2000), allowedMentions: { parse: [] } });
+  } catch (error) {
+    console.error("Couldn't send staff alert:", error.message);
+  }
+}
+
+// Adds to the running spend estimate, keeps a monthly total on disk, and warns staff as it nears the budget.
+function addSpend(cost) {
+  spentUsd += cost;
+  const month = new Date().toISOString().slice(0, 7);
+  let spend;
+  try { spend = JSON.parse(fs.readFileSync(SPEND_FILE, "utf8")); } catch { spend = {}; }
+  if (spend.month !== month) spend = { month, usd: 0, warned: [] };
+  spend.usd += cost;
+  if (MONTHLY_BUDGET_USD) {
+    for (const pct of [50, 80, 100]) {
+      if (spend.usd >= MONTHLY_BUDGET_USD * pct / 100 && !spend.warned.includes(pct)) {
+        spend.warned.push(pct);
+        staffAlert(`spend-${pct}`, `💸 The bot has used about **${pct}%** of its $${MONTHLY_BUDGET_USD} monthly budget (~$${spend.usd.toFixed(2)} this month, estimated).${pct >= 100 ? " Top up the Claude credit or raise the limit if you want it to keep answering." : ""}`, 0);
+      }
+    }
+  }
+  try { fs.writeFileSync(SPEND_FILE, JSON.stringify(spend)); } catch (e) { console.error("Couldn't save spend:", e.message); }
+}
+const monthSpend = () => { try { return JSON.parse(fs.readFileSync(SPEND_FILE, "utf8")).usd ?? 0; } catch { return 0; } };
+
+// Spam watch: lots of messages in a short time, or someone repeatedly hitting the bot's limits.
+const recentMessages = new Map(); // userId -> timestamps
+const limitHits = new Map();      // userId -> timestamps
+function tooMany(map, userId, windowMs, max) {
+  const now = Date.now();
+  const list = (map.get(userId) ?? []).filter((t) => now - t < windowMs);
+  list.push(now);
+  map.set(userId, list);
+  return list.length >= max;
+}
+function noteLimitHit(message, what) {
+  if (tooMany(limitHits, message.author.id, 10 * 60_000, 4)) {
+    staffAlert(`limits-${message.author.id}`, `🚩 **${displayName(message)}** keeps hitting the bot's limits (${what}) in ${message.channel}.`);
+  }
+}
 let state = "Starting";
 let lastError = "";
 const startedAt = new Date();
@@ -303,13 +359,16 @@ async function draftPostText(game, emoji, details, currentText) {
       ? `Update this post with the change below. Keep everything else the same.\n\nChange: ${details}\n\nCurrent post:\n${currentText}`
       : `Game: ${emoji} ${game}\nInfo: ${details}` }],
   });
-  spentUsd += response.usage.input_tokens * PRICE_IN + response.usage.output_tokens * PRICE_OUT;
+  addSpend(response.usage.input_tokens * PRICE_IN + response.usage.output_tokens * PRICE_OUT);
   return response.content.filter((b) => b.type === "text").map((b) => b.text).join("").trim().slice(0, 1800);
 }
 
 async function submitChangeRequest(message, { kind, game, emoji, details }) {
   const count = requestsToday.get(message.author.id) ?? 0;
-  if (count >= REQUESTS_PER_PERSON) return message.reply(`You've sent ${REQUESTS_PER_PERSON} requests today. Try again tomorrow.`);
+  if (count >= REQUESTS_PER_PERSON) {
+    noteLimitHit(message, "the daily request limit");
+    return message.reply(`You've sent ${REQUESTS_PER_PERSON} requests today. Try again tomorrow.`);
+  }
   requestsToday.set(message.author.id, count + 1);
 
   const request = { kind, game, emoji, details, by: message.author.id, channelId: message.channelId, messageId: message.id, status: "pending" };
@@ -421,6 +480,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
     }
   } catch (error) {
     console.error("Applying request failed:", error.message);
+    staffAlert(`apply-${id}`, `⚠️ Bot problem: an approved request didn't go through (${error.message.slice(0, 200)}).`, 0);
     outcome = `⚠️ Approved, but it didn't go through: ${error.message}`;
     request.status = "failed";
   }
@@ -485,7 +545,10 @@ async function cleanUpRooms() {
     if (!channel) { delete rooms[id]; changed = true; continue; }
     if (channel.members.size > 0) { info.lastActive = Date.now(); changed = true; continue; }
     if (Date.now() - info.lastActive > ROOM_EMPTY_MS) {
-      await channel.delete("Game room empty for 10 minutes").catch((e) => console.error("Couldn't delete room:", e.message));
+      await channel.delete("Game room empty for 10 minutes").catch((e) => {
+        console.error("Couldn't delete room:", e.message);
+        staffAlert(`room-${id}`, `⚠️ Bot problem: couldn't delete the empty game room ${channel} (${e.message.slice(0, 150)}).`, 6 * 60 * 60_000);
+      });
       delete rooms[id];
       changed = true;
       console.log(`[rooms] closed ${info.name}`);
@@ -533,6 +596,7 @@ async function checkPatchNotes() {
       }
     } catch (error) {
       console.error(`Patch notes check failed for ${feed.name}:`, error.message);
+      staffAlert(`patch-${feed.appId}`, `⚠️ Bot problem: checking ${feed.name} patch notes failed (${error.message.slice(0, 200)}).`, 6 * 60 * 60_000);
     }
   }
 }
@@ -568,7 +632,7 @@ async function handlePatchItem(feed, item, covers = new Map()) {
     messages: [{ role: "user", content: `Game: ${feed.name}\nTitle: ${item.title}\n\n${text.slice(0, 20_000)}` }],
   });
   const cost = response.usage.input_tokens * PRICE_IN + response.usage.output_tokens * PRICE_OUT;
-  spentUsd += cost;
+  addSpend(cost);
   const summary = response.content.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
   if (!summary || summary === "SKIP" || response.stop_reason === "refusal") {
     console.log(`[patch] ${feed.name}: skipped "${item.title}" (not game changes), ~$${cost.toFixed(5)}`);
@@ -603,14 +667,25 @@ function writePatchState(stateAll) {
 discord.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.inGuild()) return;
 
+  // Spam watch across every channel the bot can see: 8+ messages in 10 seconds.
+  if (tooMany(recentMessages, message.author.id, 10_000, 8)) {
+    staffAlert(`spam-${message.author.id}`, `🚩 **${displayName(message)}** is sending a lot of messages very fast in ${message.channel}.`);
+  }
+
   const inAskChannel = Boolean(ASK_CHANNEL_ID) && message.channelId === ASK_CHANNEL_ID;
   const mentioned = message.mentions.users.has(discord.user.id);
   if (!inAskChannel && !mentioned) return;
+
+  // Trying to get the bot to mass-ping (it can't, but staff should know someone tried).
+  if (/@everyone|@here|ping (every|all)|mass ?ping/i.test(message.content)) {
+    staffAlert(`massping-${message.author.id}`, `🚩 **${displayName(message)}** tried to get the bot to mass-ping in ${message.channel}: "${message.cleanContent.slice(0, 200)}"`);
+  }
 
   // Daily cap, reset at midnight.
   const today = new Date().toDateString();
   if (today !== day) { day = today; askedToday = 0; searchSpentToday = 0; researchedToday = 0; researchByPerson.clear(); requestsToday.clear(); }
   if (askedToday >= DAILY_LIMIT) {
+    staffAlert("daily-cap", `⚠️ The bot hit its daily limit of ${DAILY_LIMIT} questions, so it's stopped answering until midnight.`, 12 * 60 * 60_000);
     return message.reply("I've hit my question limit for today. Try again tomorrow!");
   }
 
@@ -618,6 +693,7 @@ discord.on(Events.MessageCreate, async (message) => {
   const now = Date.now();
   const waitMs = (lastAsked.get(message.author.id) ?? 0) + USER_COOLDOWN_MS - now;
   if (waitMs > 0) {
+    noteLimitHit(message, "the cooldown between questions");
     return message.reply(`Give me ${Math.ceil(waitMs / 1000)}s before your next question.`);
   }
   lastAsked.set(message.author.id, now);
@@ -651,7 +727,7 @@ discord.on(Events.MessageCreate, async (message) => {
     const searches = response.usage.server_tool_use?.web_search_requests ?? 0;
     const fetches = response.usage.server_tool_use?.web_fetch_requests ?? 0;
     const cost = response.usage.input_tokens * PRICE_IN + response.usage.output_tokens * PRICE_OUT + searches * PRICE_SEARCH;
-    spentUsd += cost;
+    addSpend(cost);
     if (searches || fetches) {
       searchSpentToday += cost;
       researchedToday++;
@@ -661,6 +737,7 @@ discord.on(Events.MessageCreate, async (message) => {
     writeStatus();
 
     if (response.stop_reason === "refusal") {
+      staffAlert(`refusal-${message.author.id}`, `🚩 The bot refused a request from **${displayName(message)}** in ${message.channel}: "${message.cleanContent.slice(0, 200)}"`);
       return message.reply("Sorry, I can't help with that one.");
     }
     // A game room request: make the room and announce it ourselves; no second Claude call needed.
@@ -680,8 +757,16 @@ discord.on(Events.MessageCreate, async (message) => {
     console.error("Claude request failed:", error?.status, error?.type ?? "", error?.message);
     lastError = `${new Date().toLocaleString("en-GB")}: ${friendlyError(error)}`;
     writeStatus();
+    staffAlert(`claude-${error?.type ?? error?.status ?? "error"}`, `⚠️ Bot problem: ${friendlyError(error)}\n-# ${error?.status ?? ""} ${error?.type ?? ""} ${String(error?.message ?? "").slice(0, 200)}`);
     await message.reply(friendlyError(error)).catch(() => {});
   }
+});
+
+// Members leaving.
+discord.on(Events.GuildMemberRemove, (member) => {
+  if (member.user.bot) return;
+  const joined = member.joinedAt ? ` (joined ${member.joinedAt.toLocaleDateString("en-GB")})` : "";
+  staffAlert(`leave-${member.id}`, `📤 **${member.displayName ?? member.user.username}** (@${member.user.username}) left the server${joined}.`, 0);
 });
 
 // ---- Helpers ----------------------------------------------------------------
@@ -742,6 +827,7 @@ ${row("Questions today", `${askedToday} of ${DAILY_LIMIT}`)}
 ${row("Researched questions today", `${researchedToday} (max ${RESEARCH_PER_PERSON} per person)`)}
 ${row("Search budget today", `~$${searchSpentToday.toFixed(3)} of $${SEARCH_BUDGET_USD.toFixed(2)}`)}
 ${row("Spent since restart", `~$${spentUsd.toFixed(4)}`)}
+${row("Spent this month", `~$${monthSpend().toFixed(2)}${MONTHLY_BUDGET_USD ? ` of $${MONTHLY_BUDGET_USD} budget` : ""}`)}
 ${row("Running since", startedAt.toLocaleString("en-GB"))}
 ${PATCH_FEEDS.length ? row("Patch notes", `${PATCH_FEEDS.map((f) => f.name).join(", ")}; last posted: ${lastPatch || "none since restart"}`) : ""}
 ${lastError ? row("Last error", lastError) : ""}
