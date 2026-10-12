@@ -63,11 +63,11 @@ const ROOM_TOOL = {
 };
 const ROOMS_ON = `\n- If someone asks you to make, open or start a voice chat, room, vc or lobby for a game, call create_game_room instead of replying.`;
 const ROOMS_OFF = `\n- If someone asks you to make a game room or voice chat, tell them only members can do that.`;
-// Game tags: every post in the games forum gets a ping role; reacting with TAG_EMOJI on the post's
-// first message gives you the role, removing the reaction takes it away.
+// Game tags: every post in the games forum gets a ping role; reacting with the post's title emoji
+// (or TAG_EMOJI if it has none) on its first message gives you the role, removing it takes it away.
 const GAMES_FORUM_ID = process.env.GAMES_FORUM_ID || "";
-const TAG_EMOJI = "🔔";
-const TAGS_FILE = path.join(here, "tags.json"); // forum post id -> { roleId, noted }
+const TAG_EMOJI = "🔔";                         // fallback when a post title has no emoji
+const TAGS_FILE = path.join(here, "tags.json"); // forum post id -> { roleId, emoji, noted, noteId }
 const MAX_TOKENS = 2000;
 const HISTORY_MESSAGES = 10;    // recent channel messages sent as context
 const USER_COOLDOWN_MS = 15_000; // per person, between questions
@@ -142,6 +142,11 @@ function saveTags(tags) {
 }
 // "🦸 Apex Legends" -> "Apex Legends"
 const gameNameFromPost = (name) => name.replace(/^[^\p{L}\p{N}]+/u, "").trim();
+// "🦸 Apex Legends" -> "🦸"; posts without a leading emoji use the bell.
+const emojiFromPost = (name) => name.match(/^\p{Extended_Pictographic}(?:️|‍\p{Extended_Pictographic}|\p{Emoji_Modifier})*/u)?.[0] ?? TAG_EMOJI;
+// Discord sometimes drops the invisible variation selector, so compare without it.
+const sameEmoji = (a, b) => a?.replace(/️/g, "") === b?.replace(/️/g, "");
+const tagNote = (emoji, roleName) => `-# React ${emoji} on this post to get the @${roleName} tag, so you get pinged when people want to play. Remove it to stop.`;
 
 async function setupAllGameTags() {
   const forum = await discord.channels.fetch(GAMES_FORUM_ID);
@@ -152,7 +157,7 @@ async function setupAllGameTags() {
   }
 }
 
-// Makes sure a forum post has a ping role, a bell reaction on its first message, and a note saying how it works.
+// Makes sure a forum post has a ping role, its title emoji as a reaction on its first message, and a note saying how it works.
 async function setupGameTag(thread) {
   const tags = loadTags();
   const game = gameNameFromPost(thread.name);
@@ -171,25 +176,37 @@ async function setupGameTag(thread) {
 
   const starter = await thread.fetchStarterMessage().catch(() => null);
   if (!starter) return;
-  if (!starter.reactions.cache.get(TAG_EMOJI)?.me) await starter.react(TAG_EMOJI);
-  if (!tags[thread.id].noted) {
-    const note = `-# React ${TAG_EMOJI} on this post to get the @${role.name} tag, so you get pinged when people want to play. Remove it to stop.`;
-    if (starter.author.id === discord.user.id) {
-      if (!starter.content.includes(TAG_EMOJI)) await starter.edit({ content: `${starter.content}\n${note}`.slice(0, 2000), allowedMentions: { parse: [] } });
-    } else {
-      await thread.send({ content: note, allowedMentions: { parse: [] } });
-    }
-    tags[thread.id].noted = true;
-    saveTags(tags);
+  const entry = tags[thread.id];
+  const emoji = emojiFromPost(thread.name);
+  const oldEmoji = entry.emoji ?? (entry.noted ? TAG_EMOJI : null); // older entries used the bell
+  if (oldEmoji && !sameEmoji(oldEmoji, emoji)) {
+    // The title emoji changed (or this post still has the old bell): swap the reaction and the note.
+    await starter.reactions.cache.find((r) => sameEmoji(r.emoji.name, oldEmoji))?.users.remove(discord.user.id).catch(() => {});
+    entry.noted = false;
   }
+  if (!starter.reactions.cache.find((r) => sameEmoji(r.emoji.name, emoji))?.me) await starter.react(emoji);
+  entry.emoji = emoji;
+  if (!entry.noted) {
+    const note = tagNote(emoji, role.name);
+    if (starter.author.id === discord.user.id) {
+      const kept = starter.content.split("\n").filter((line) => !line.startsWith("-# React ")).join("\n");
+      await starter.edit({ content: `${kept}\n${note}`.slice(0, 2000), allowedMentions: { parse: [] } });
+    } else if (entry.noteId) {
+      await thread.messages.edit(entry.noteId, { content: note, allowedMentions: { parse: [] } }).catch(() => {});
+    } else {
+      entry.noteId = (await thread.send({ content: note, allowedMentions: { parse: [] } })).id;
+    }
+    entry.noted = true;
+  }
+  saveTags(tags);
 }
 
 async function onTagReaction(reaction, user, add) {
   if (user.bot) return;
   if (reaction.partial) await reaction.fetch().catch(() => null);
-  if (reaction.emoji.name !== TAG_EMOJI) return;
   const entry = loadTags()[reaction.message.channelId];
   if (!entry || reaction.message.id !== reaction.message.channelId) return; // only the post's first message
+  if (!sameEmoji(reaction.emoji.name, entry.emoji ?? TAG_EMOJI)) return;
   const member = await reaction.message.guild.members.fetch(user.id).catch(() => null);
   if (!member) return;
   if (add) await member.roles.add(entry.roleId, "Picked up a game tag").catch((e) => console.error("Tag add failed:", e.message));
