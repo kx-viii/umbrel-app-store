@@ -20,7 +20,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Anthropic from "@anthropic-ai/sdk";
-import { ChannelType, Client, Events, GatewayIntentBits, OverwriteType, Partials, PermissionFlagsBits } from "discord.js";
+import {
+  ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, EmbedBuilder, Events, GatewayIntentBits,
+  OverwriteType, Partials, PermissionFlagsBits,
+} from "discord.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 for (const file of [path.join(here, ".env"), path.join(here, "..", "connector", ".env")]) {
@@ -63,6 +66,29 @@ const ROOM_TOOL = {
 };
 const ROOMS_ON = `\n- If someone asks you to make, open or start a voice chat, room, vc or lobby for a game, call create_game_room instead of replying.`;
 const ROOMS_OFF = `\n- If someone asks you to make a game room or voice chat, tell them only members can do that.`;
+// Change requests: anyone can ask for a server change; it goes to the staff channel with Approve/Decline
+// buttons and only happens once someone with the staff role approves it.
+const STAFF_CHANNEL_ID = process.env.STAFF_CHANNEL_ID || "";
+const STAFF_ROLE_ID = process.env.STAFF_ROLE_ID || "";
+const REQUESTS_PER_PERSON = 3;      // change requests per person per day
+const REQUESTS_FILE = path.join(here, "requests.json");
+const REQUEST_TOOL = {
+  name: "request_change",
+  description: "Send a request to change the server to the staff for approval. Use it when someone asks for something to be added, removed or changed: a game in the games forum, a game's server info (IP, modpack, password, how to join), channels, roles or anything else about the server. Never use it for questions.",
+  input_schema: {
+    type: "object",
+    properties: {
+      kind: { type: "string", enum: ["add_game", "update_game_info", "remove_game", "other"], description: "add_game: new post in the games forum. update_game_info: change the info in an existing game's post. remove_game: delete a game's post. other: anything else (channels, roles, rules...)" },
+      game: { type: "string", description: "The game's proper name, e.g. Valorant. Empty for kind other." },
+      emoji: { type: "string", description: "For add_game: one fitting emoji for the game, e.g. 🎯. Otherwise empty." },
+      details: { type: "string", description: "What they want, in a sentence or two, including any info they gave (IP, password, modpack, steps)." },
+    },
+    required: ["kind", "game", "emoji", "details"],
+    additionalProperties: false,
+  },
+  strict: true,
+};
+const REQUESTS_ON = `\n- You can't change the server yourself. If someone asks for a change (add or remove a game, change server info, channels, roles), call request_change so the staff can approve it.`;
 // Game tags: every post in the games forum gets a ping role; reacting with the post's title emoji
 // (or TAG_EMOJI if it has none) on its first message gives you the role, removing it takes it away.
 const GAMES_FORUM_ID = process.env.GAMES_FORUM_ID || "";
@@ -235,6 +261,178 @@ discord.on(Events.ThreadCreate, async (thread, newlyCreated) => {
 });
 discord.on(Events.MessageReactionAdd, (reaction, user) => onTagReaction(reaction, user, true));
 discord.on(Events.MessageReactionRemove, (reaction, user) => onTagReaction(reaction, user, false));
+
+// ---- Change requests --------------------------------------------------------
+function loadRequests() {
+  try { return JSON.parse(fs.readFileSync(REQUESTS_FILE, "utf8")); } catch { return {}; }
+}
+function saveRequests(requests) {
+  try { fs.writeFileSync(REQUESTS_FILE, JSON.stringify(requests, null, 2)); } catch (e) { console.error("Couldn't save requests:", e.message); }
+}
+const requestsToday = new Map(); // userId -> count (resets with the daily counters)
+
+// Finds the games-forum post for a game name, using the posts the tag system knows about.
+async function findGamePost(guild, game) {
+  const lower = String(game).toLowerCase().trim();
+  for (const id of Object.keys(loadTags())) {
+    const thread = await guild.channels.fetch(id).catch(() => null);
+    if (!thread) continue;
+    const name = gameNameFromPost(thread.name).toLowerCase();
+    if (name === lower || name.startsWith(lower + " ") || lower.startsWith(name + " ")) return thread;
+  }
+  return null;
+}
+
+// Steam's logo-free hero art for a game, if it's on Steam. Shown in the approval message so staff can check it.
+async function steamArt(game) {
+  try {
+    const search = await (await fetch(`https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(game)}&cc=gb&l=english`)).json();
+    const hit = search.items?.find((i) => i.name.toLowerCase().replace(/[^a-z0-9]/g, "") === game.toLowerCase().replace(/[^a-z0-9]/g, "")) ?? search.items?.[0];
+    if (!hit) return null;
+    const url = `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${hit.id}/library_hero.jpg`;
+    return (await fetch(url, { method: "HEAD" })).ok ? { url, steamName: hit.name } : null;
+  } catch { return null; }
+}
+
+// Writes the new opening text for a game post from the request, keeping the same layout.
+async function draftPostText(game, emoji, details, currentText) {
+  const response = await anthropic.messages.create({
+    model: MODEL, max_tokens: 800, output_config: { effort: "low" },
+    system: "You write the opening message of a game's post in a Discord games forum. Plain, direct British English. Format: a '# <emoji> <Game>' heading, then the key facts in bold labels (e.g. **IP:**, **Password:**, **Modpack:**), then a short numbered 'How to join' list if there are steps. Only include facts you're given; never invent IPs, passwords or links. No closing remarks. Reply with the message text only.",
+    messages: [{ role: "user", content: currentText
+      ? `Update this post with the change below. Keep everything else the same.\n\nChange: ${details}\n\nCurrent post:\n${currentText}`
+      : `Game: ${emoji} ${game}\nInfo: ${details}` }],
+  });
+  spentUsd += response.usage.input_tokens * PRICE_IN + response.usage.output_tokens * PRICE_OUT;
+  return response.content.filter((b) => b.type === "text").map((b) => b.text).join("").trim().slice(0, 1800);
+}
+
+async function submitChangeRequest(message, { kind, game, emoji, details }) {
+  const count = requestsToday.get(message.author.id) ?? 0;
+  if (count >= REQUESTS_PER_PERSON) return message.reply(`You've sent ${REQUESTS_PER_PERSON} requests today. Try again tomorrow.`);
+  requestsToday.set(message.author.id, count + 1);
+
+  const request = { kind, game, emoji, details, by: message.author.id, channelId: message.channelId, messageId: message.id, status: "pending" };
+  let preview = "";
+  let image = null;
+  if (kind === "add_game") {
+    if (await findGamePost(message.guild, game)) return message.reply(`There's already a post for ${game} in the games forum.`);
+    request.emoji = emoji || "🎮";
+    request.text = await draftPostText(game, request.emoji, details);
+    image = await steamArt(game);
+    request.image = image?.url ?? null;
+    preview = `**Post title:** ${request.emoji} ${game}\n**Post text:**\n${request.text}\n**Image:** ${image ? `Steam art for ${image.steamName} (below)` : "none found"}`;
+  } else if (kind === "update_game_info" || kind === "remove_game") {
+    const post = await findGamePost(message.guild, game);
+    if (!post) return message.reply(`I couldn't find a post for ${game} in the games forum.`);
+    request.postId = post.id;
+    if (kind === "update_game_info") {
+      const starter = await post.fetchStarterMessage().catch(() => null);
+      if (!starter || starter.author.id !== discord.user.id) {
+        // The bot can only edit its own posts, so staff handle this one by hand.
+        await postToStaff(message, { ...request, kind: "other" }, details);
+        return message.reply("Request sent");
+      }
+      const kept = starter.content.split("\n").filter((l) => !l.startsWith("-# React ")).join("\n");
+      request.text = await draftPostText(game, "", details, kept);
+      preview = `**New ${game} post text:**\n${request.text}`;
+    } else {
+      preview = `**Delete the ${post.name} post and its game tag.**`;
+    }
+  } else {
+    preview = details;
+  }
+  await postToStaff(message, request, preview, image?.url);
+  await message.reply("Request sent");
+}
+
+const KIND_LABEL = { add_game: "add a game", update_game_info: "change a game's info", remove_game: "remove a game", other: "a change" };
+
+async function postToStaff(message, request, preview, imageUrl) {
+  const staff = await discord.channels.fetch(STAFF_CHANNEL_ID);
+  const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`req:approve:${id}`).setLabel("Approve").setEmoji("✅").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`req:decline:${id}`).setLabel("Decline").setEmoji("❌").setStyle(ButtonStyle.Danger),
+  );
+  const sent = await staff.send({
+    content: `📝 **${displayName(message)}** wants to ${KIND_LABEL[request.kind]}${request.game ? `: **${request.game}**` : ""}\n> ${request.details.replace(/\n/g, "\n> ")}\n${request.kind === "other" ? "" : `\n${preview}`}\n-# Asked in ${message.channel} · ${message.url}`.slice(0, 2000),
+    embeds: imageUrl ? [new EmbedBuilder().setImage(imageUrl)] : [],
+    components: [row],
+    allowedMentions: { parse: [] },
+  });
+  const requests = loadRequests();
+  requests[id] = { ...request, staffMessageId: sent.id, createdAt: Date.now() };
+  saveRequests(requests);
+  console.log(`[requests] ${message.author.tag}: ${request.kind} ${request.game || ""}`);
+}
+
+async function applyRequest(guild, request) {
+  if (request.kind === "add_game") {
+    const forum = await discord.channels.fetch(GAMES_FORUM_ID);
+    await forum.threads.create({
+      name: `${request.emoji} ${request.game}`.slice(0, 100),
+      message: { content: request.text, files: request.image ? [{ attachment: request.image, name: "game.jpg" }] : [], allowedMentions: { parse: [] } },
+      reason: "Approved change request",
+    }); // the game tag, emoji reaction and note are added by the ThreadCreate handler
+    return `Added **${request.game}** to the games forum.`;
+  }
+  if (request.kind === "update_game_info") {
+    const post = await discord.channels.fetch(request.postId);
+    const starter = await post.fetchStarterMessage();
+    const note = starter.content.split("\n").filter((l) => l.startsWith("-# React ")).join("\n");
+    await starter.edit({ content: `${request.text}${note ? `\n${note}` : ""}`.slice(0, 2000), allowedMentions: { parse: [] } });
+    return `Updated the **${request.game}** post.`;
+  }
+  if (request.kind === "remove_game") {
+    const tags = loadTags();
+    const role = guild.roles.cache.get(tags[request.postId]?.roleId);
+    const post = await discord.channels.fetch(request.postId).catch(() => null);
+    await post?.delete("Approved change request");
+    if (isSafeTagRole(role)) await role.delete("Approved change request: game removed");
+    delete tags[request.postId];
+    saveTags(tags);
+    return `Removed **${request.game}** and its tag.`;
+  }
+  return null; // "other": staff do it themselves
+}
+
+discord.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isButton() || !interaction.customId.startsWith("req:")) return;
+  const [, action, id] = interaction.customId.split(":");
+  if (!interaction.member?.roles.cache.has(STAFF_ROLE_ID)) {
+    return interaction.reply({ content: "Only staff can approve or decline requests.", ephemeral: true });
+  }
+  const requests = loadRequests();
+  const request = requests[id];
+  if (!request || request.status !== "pending") {
+    return interaction.reply({ content: "That request has already been dealt with.", ephemeral: true });
+  }
+  await interaction.deferUpdate();
+  let outcome;
+  try {
+    if (action === "approve") {
+      const done = await applyRequest(interaction.guild, request);
+      outcome = done ? `✅ Approved by ${interaction.member.displayName}: ${done}` : `✅ Approved by ${interaction.member.displayName}. Staff will sort it.`;
+      request.status = "approved";
+    } else {
+      outcome = `❌ Declined by ${interaction.member.displayName}.`;
+      request.status = "declined";
+    }
+  } catch (error) {
+    console.error("Applying request failed:", error.message);
+    outcome = `⚠️ Approved, but it didn't go through: ${error.message}`;
+    request.status = "failed";
+  }
+  requests[id] = request;
+  saveRequests(requests);
+  await interaction.message.edit({ content: `${interaction.message.content}\n**${outcome}**`.slice(0, 2000), components: [] }).catch(() => {});
+  // Let the person who asked know, as a reply to their original message.
+  const channel = await discord.channels.fetch(request.channelId).catch(() => null);
+  const original = await channel?.messages.fetch(request.messageId).catch(() => null);
+  const verdict = request.status === "declined" ? "Request declined" : request.status === "failed" ? "Request approved, but it didn't go through" : "Request approved";
+  await (original ? original.reply(verdict) : channel?.send(`<@${request.by}> ${verdict}`))?.catch(() => {});
+});
 
 // ---- Game rooms -------------------------------------------------------------
 function isMember(member) {
@@ -411,7 +609,7 @@ discord.on(Events.MessageCreate, async (message) => {
 
   // Daily cap, reset at midnight.
   const today = new Date().toDateString();
-  if (today !== day) { day = today; askedToday = 0; searchSpentToday = 0; researchedToday = 0; researchByPerson.clear(); }
+  if (today !== day) { day = today; askedToday = 0; searchSpentToday = 0; researchedToday = 0; researchByPerson.clear(); requestsToday.clear(); }
   if (askedToday >= DAILY_LIMIT) {
     return message.reply("I've hit my question limit for today. Try again tomorrow!");
   }
@@ -433,13 +631,14 @@ discord.on(Events.MessageCreate, async (message) => {
     const personResearched = researchByPerson.get(message.author.id) ?? 0;
     const canSearch = searchSpentToday < SEARCH_BUDGET_USD && personResearched < RESEARCH_PER_PERSON;
     const canMakeRooms = Boolean(ROOMS_CATEGORY_ID) && isMember(message.member);
-    const tools = [...(canSearch ? RESEARCH_TOOLS : []), ...(canMakeRooms ? [ROOM_TOOL] : [])];
+    const canRequest = Boolean(STAFF_CHANNEL_ID && STAFF_ROLE_ID);
+    const tools = [...(canSearch ? RESEARCH_TOOLS : []), ...(canMakeRooms ? [ROOM_TOOL] : []), ...(canRequest ? [REQUEST_TOOL] : [])];
     const response = await anthropic.messages.create({
       model: MODEL,
       max_tokens: MAX_TOKENS,
       output_config: { effort: "medium" },
       ...(tools.length && { tools }),
-      system: systemPrompt(discord.user.username, message.guild.name, canSearch) + (ROOMS_CATEGORY_ID ? (canMakeRooms ? ROOMS_ON : ROOMS_OFF) : ""),
+      system: systemPrompt(discord.user.username, message.guild.name, canSearch) + (ROOMS_CATEGORY_ID ? (canMakeRooms ? ROOMS_ON : ROOMS_OFF) : "") + (canRequest ? REQUESTS_ON : ""),
       messages: [{
         role: "user",
         content:
@@ -467,6 +666,8 @@ discord.on(Events.MessageCreate, async (message) => {
     // A game room request: make the room and announce it ourselves; no second Claude call needed.
     const roomCall = response.content.find((b) => b.type === "tool_use" && b.name === ROOM_TOOL.name);
     if (roomCall) return createGameRoom(message, roomCall.input);
+    const requestCall = response.content.find((b) => b.type === "tool_use" && b.name === REQUEST_TOOL.name);
+    if (requestCall) return submitChangeRequest(message, requestCall.input);
     const textBlocks = response.content.filter((b) => b.type === "text");
     let text = textBlocks.map((b) => b.text).join("").trim();
     if (!text) text = "I didn't come up with an answer for that. Try rephrasing?";
