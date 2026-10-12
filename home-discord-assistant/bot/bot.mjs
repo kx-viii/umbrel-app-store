@@ -293,6 +293,7 @@ async function checkPatchNotes() {
     try {
       const url = `https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=${feed.appId}&count=10&maxlength=0&feeds=steam_community_announcements&format=json`;
       const items = (await (await fetch(url)).json()).appnews?.newsitems ?? [];
+      const covers = await steamCoverImages(feed.appId);
       const seen = stateAll[feed.appId];
       const remember = (item) => {
         const prev = stateAll[feed.appId];
@@ -305,7 +306,7 @@ async function checkPatchNotes() {
       if (!seen) {
         // First check: post the newest announcement that has game changes, and mark everything as seen.
         for (const item of [...items].sort((a, b) => b.date - a.date)) {
-          if (await handlePatchItem(feed, item)) break;
+          if (await handlePatchItem(feed, item, covers)) break;
         }
         for (const item of items) remember(item);
         continue;
@@ -314,7 +315,7 @@ async function checkPatchNotes() {
         .filter((item) => item.date >= seen.date && !seen.gids?.includes(item.gid))
         .sort((a, b) => a.date - b.date);
       for (const item of fresh) {
-        await handlePatchItem(feed, item);
+        await handlePatchItem(feed, item, covers);
         remember(item);
       }
     } catch (error) {
@@ -323,7 +324,26 @@ async function checkPatchNotes() {
   }
 }
 
-async function handlePatchItem(feed, item) {
+// Steam's events feed has each announcement's 800x450 cover ("capsule") image; the news API doesn't.
+// Returns a map of lower-cased title -> image URL. The two feeds use different ids, so they're matched by title.
+async function steamCoverImages(appId) {
+  const covers = new Map();
+  try {
+    const url = `https://store.steampowered.com/events/ajaxgetadjacentpartnerevents/?appid=${appId}&count_before=0&count_after=20&lang_list=0`;
+    const events = (await (await fetch(url)).json()).events ?? [];
+    for (const event of events) {
+      const file = JSON.parse(event.jsondata || "{}").localized_capsule_image?.[0];
+      if (!file || !event.clan_steamid) continue;
+      const clanAccount = (BigInt(event.clan_steamid) - 103582791429521408n).toString(); // group SteamID64 -> account id
+      covers.set(event.event_name.trim().toLowerCase(), `https://clan.akamai.steamstatic.com/images/${clanAccount}/${file}`);
+    }
+  } catch (error) {
+    console.error(`Couldn't get Steam cover images for ${appId}:`, error.message);
+  }
+  return covers;
+}
+
+async function handlePatchItem(feed, item, covers = new Map()) {
   const text = item.contents.replace(/\[\/?(p|b|i|u|h\d|list|olist|\*|url[^\]]*|img[^\]]*|previewyoutube[^\]]*|table|tr|td|th|hr)\]/gi, " ").replace(/\{STEAM_CLAN_IMAGE\}[^\s]*/g, "").replace(/\s+/g, " ").trim();
   const response = await anthropic.messages.create({
     model: MODEL,
@@ -345,7 +365,11 @@ async function handlePatchItem(feed, item) {
   const link = `https://store.steampowered.com/news/app/${feed.appId}/view/${item.gid}`;
   // Sending a message reopens a forum post that Discord has auto-archived.
   const post = await discord.channels.fetch(feed.postId);
-  const sent = await post.send({ content: `📰 **${item.title}**\n${summary}\n-# Full notes: <${link}>`.slice(0, 2000) });
+  const cover = covers.get(item.title.trim().toLowerCase());
+  const sent = await post.send({
+    content: `📰 **${item.title}**\n${summary}\n-# Full notes: <${link}>`.slice(0, 2000),
+    files: cover ? [{ attachment: cover, name: `patch-notes${path.extname(new URL(cover).pathname) || ".jpg"}` }] : [],
+  });
   if (GAMES_CHAT_ID) {
     const chat = await discord.channels.fetch(GAMES_CHAT_ID);
     await chat.send(`📰 New **${feed.name}** patch notes: ${item.title} → ${sent.url}`);
