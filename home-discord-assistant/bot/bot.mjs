@@ -140,6 +140,14 @@ function loadTags() {
 function saveTags(tags) {
   try { fs.writeFileSync(TAGS_FILE, JSON.stringify(tags, null, 2)); } catch (e) { console.error("Couldn't save tags:", e.message); }
 }
+// A role is only treated as a game tag if it's recorded in tags.json, has no permissions, isn't managed by an
+// integration and isn't one of the member roles. Everything that grants or pings tags goes through this.
+function isSafeTagRole(role) {
+  return Boolean(role) && !role.managed && role.permissions.bitfield === 0n && !MEMBER_ROLE_IDS.includes(role.id) && role.id !== role.guild.id;
+}
+function gameTagRoles(guild, tags = loadTags()) {
+  return Object.values(tags).map((t) => guild.roles.cache.get(t.roleId)).filter(isSafeTagRole);
+}
 // "🦸 Apex Legends" -> "Apex Legends"
 const gameNameFromPost = (name) => name.replace(/^[^\p{L}\p{N}]+/u, "").trim();
 // "🦸 Apex Legends" -> "🦸"; posts without a leading emoji use the bell.
@@ -152,9 +160,12 @@ async function setupAllGameTags() {
   const forum = await discord.channels.fetch(GAMES_FORUM_ID);
   const active = await forum.threads.fetchActive();
   const archived = await forum.threads.fetchArchived({ limit: 100 });
-  for (const thread of [...active.threads.values(), ...archived.threads.values()]) {
-    if (thread.parentId === GAMES_FORUM_ID) await setupGameTag(thread).catch((e) => console.error(`Tag setup for ${thread.name}:`, e.message));
-  }
+  const threads = [...active.threads.values(), ...archived.threads.values()].filter((t) => t.parentId === GAMES_FORUM_ID);
+  // Forget posts that have been deleted, so their old tag can't be handed out any more.
+  const tags = loadTags();
+  for (const id of Object.keys(tags)) if (!threads.some((t) => t.id === id)) delete tags[id];
+  saveTags(tags);
+  for (const thread of threads) await setupGameTag(thread).catch((e) => console.error(`Tag setup for ${thread.name}:`, e.message));
 }
 
 // Makes sure a forum post has a ping role, its title emoji as a reaction on its first message, and a note saying how it works.
@@ -165,9 +176,10 @@ async function setupGameTag(thread) {
   const guild = thread.guild;
   let role = tags[thread.id] && guild.roles.cache.get(tags[thread.id].roleId);
   if (!role) {
+    // Only ever reuse a role that's already a game tag, so a post can never be named to hand out a real role
+    // (e.g. a post named after the member role can't hand that role out). Otherwise make a fresh, powerless tag.
     const lower = game.toLowerCase();
-    role = guild.roles.cache.find((r) => !r.managed && r.mentionable && r.permissions.bitfield === 0n &&
-      (r.name.toLowerCase() === lower || lower.startsWith(r.name.toLowerCase() + " ")));
+    role = gameTagRoles(guild, tags).find((r) => r.name.toLowerCase() === lower || lower.startsWith(r.name.toLowerCase() + " "));
     role ??= await guild.roles.create({ name: game.slice(0, 100), mentionable: true, permissions: [], reason: `Game tag for the ${game} post` });
     tags[thread.id] = { roleId: role.id, noted: false };
     saveTags(tags);
@@ -209,6 +221,9 @@ async function onTagReaction(reaction, user, add) {
   if (!sameEmoji(reaction.emoji.name, entry.emoji ?? TAG_EMOJI)) return;
   const member = await reaction.message.guild.members.fetch(user.id).catch(() => null);
   if (!member) return;
+  if (!isSafeTagRole(reaction.message.guild.roles.cache.get(entry.roleId))) {
+    return console.error(`Refused to hand out role ${entry.roleId}: it isn't a plain game tag`);
+  }
   if (add) await member.roles.add(entry.roleId, "Picked up a game tag").catch((e) => console.error("Tag add failed:", e.message));
   else await member.roles.remove(entry.roleId, "Dropped a game tag").catch((e) => console.error("Tag remove failed:", e.message));
 }
@@ -254,9 +269,9 @@ async function createGameRoom(message, { game, public: isPublic }) {
   rooms[room.id] = { name, createdAt: Date.now(), lastActive: Date.now(), by: message.author.id };
   saveRooms(rooms);
 
-  // Ping the matching game tag, if there is one.
   const gameName = name.slice(2).toLowerCase();
-  const tag = message.guild.roles.cache.find((r) => r.mentionable && !r.managed && (r.name.toLowerCase() === gameName || gameName.startsWith(r.name.toLowerCase() + " ")));
+  // Ping the matching game tag, if there is one, and only ever a game tag (never a member role or @everyone).
+  const tag = gameTagRoles(message.guild).find((r) => r.name.toLowerCase() === gameName || gameName.startsWith(r.name.toLowerCase() + " "));
   await message.reply({
     content: `🔊 ${isPublic ? "Public room" : "Room"} for **${name.slice(2)}** is open: ${room}${tag ? ` ${tag}` : ""}\n-# It closes after 10 minutes empty.`,
     allowedMentions: { roles: tag ? [tag.id] : [], repliedUser: true },
