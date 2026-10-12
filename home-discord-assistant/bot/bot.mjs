@@ -6,7 +6,11 @@
 //   ASK_CHANNEL_ID                         channel it answers everything in (otherwise @mentions only)
 //   SERVER_INFO                            a few sentences about the server, added to Claude's instructions
 //   OWNER_NAME                             who people should tell when something's wrong
+//   PERSONALITY                            how the bot should talk (tone, slang, length)
 //   MODEL, STATUS_FILE                     optional; STATUS_FILE gets a small HTML status page
+//   PATCH_FEEDS                            Steam games to post patch notes for, as steamAppId:forumPostId:Name,
+//                                          separated by ";" (e.g. 1172470:123456789:Apex Legends)
+//   GAMES_CHAT_ID                          channel that gets a short "new patch notes" heads-up
 // Run with: npm start
 
 import fs from "node:fs";
@@ -25,7 +29,15 @@ const MODEL = process.env.MODEL || "claude-haiku-5-5";
 const ASK_CHANNEL_ID = process.env.ASK_CHANNEL_ID || "";
 const SERVER_INFO = process.env.SERVER_INFO || "";
 const OWNER_NAME = process.env.OWNER_NAME || "the server owner";
+const PERSONALITY = process.env.PERSONALITY || "keep it short and casual, usually a few sentences";
 const STATUS_FILE = process.env.STATUS_FILE;
+const PATCH_FEEDS = (process.env.PATCH_FEEDS || "").split(";").map((s) => s.trim()).filter(Boolean).map((entry) => {
+  const [appId, postId, ...name] = entry.split(":");
+  return { appId, postId, name: name.join(":") };
+});
+const GAMES_CHAT_ID = process.env.GAMES_CHAT_ID || "";
+const PATCH_CHECK_MS = 30 * 60_000;                      // how often to check Steam for new posts
+const PATCH_STATE_FILE = path.join(here, "patch-state.json"); // last Steam post handled per game
 const MAX_TOKENS = 2000;
 const HISTORY_MESSAGES = 10;    // recent channel messages sent as context
 const USER_COOLDOWN_MS = 15_000; // per person, between questions
@@ -49,7 +61,8 @@ function systemPrompt(botName, serverName, canSearch) {
   return `You are ${botName}, the assistant in the Discord server "${serverName}".
 ${SERVER_INFO ? `\nAbout this server: ${SERVER_INFO}\n` : ""}
 How to reply:
-- This is Discord chat: keep it short and casual, usually a few sentences. Use Discord markdown sparingly (bold, lists, code blocks for commands or configs).
+- This is Discord chat. How to talk: ${PERSONALITY}
+- Use Discord markdown sparingly (bold, lists, code blocks for commands or configs). Facts, IPs and steps always stay clear and accurate, whatever the tone.
 - Never try to ping @everyone, @here or roles.
 - You'll be shown recent messages from the channel for context. Answer the latest question; use the earlier messages only to understand it.
 - You don't know the server's private details (IPs, passwords, whitelists, mod lists) unless they appear in the messages you're shown. Don't make them up; say who to ask instead.
@@ -79,7 +92,94 @@ discord.once(Events.ClientReady, (c) => {
   state = `Online as ${c.user.tag}`;
   writeStatus();
   console.log(`Logged in as ${c.user.tag}. Model ${MODEL}, ask channel ${ASK_CHANNEL_ID || "none (mentions only)"}.`);
+  if (PATCH_FEEDS.length) {
+    console.log(`Patch notes for: ${PATCH_FEEDS.map((f) => f.name).join(", ")} (checking every ${PATCH_CHECK_MS / 60_000} min)`);
+    setTimeout(checkPatchNotes, 30_000);
+    setInterval(checkPatchNotes, PATCH_CHECK_MS);
+  }
 });
+
+// ---- Patch notes ------------------------------------------------------------
+// Checks each game's Steam announcements. New ones that contain actual game changes get a short
+// Claude summary posted in the game's forum post, plus a heads-up in the games chat linking to it.
+// On the very first check for a game, only the newest announcement with game changes is posted.
+let lastPatch = "";
+
+async function checkPatchNotes() {
+  const stateAll = readPatchState();
+  for (const feed of PATCH_FEEDS) {
+    try {
+      const url = `https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=${feed.appId}&count=10&maxlength=0&feeds=steam_community_announcements&format=json`;
+      const items = (await (await fetch(url)).json()).appnews?.newsitems ?? [];
+      const seen = stateAll[feed.appId];
+      const remember = (item) => {
+        const prev = stateAll[feed.appId];
+        stateAll[feed.appId] = {
+          date: Math.max(item.date, prev?.date ?? 0),
+          gids: [...(prev?.gids ?? []), item.gid].slice(-30),
+        };
+        writePatchState(stateAll);
+      };
+      if (!seen) {
+        // First check: post the newest announcement that has game changes, and mark everything as seen.
+        for (const item of [...items].sort((a, b) => b.date - a.date)) {
+          if (await handlePatchItem(feed, item)) break;
+        }
+        for (const item of items) remember(item);
+        continue;
+      }
+      const fresh = items
+        .filter((item) => item.date >= seen.date && !seen.gids?.includes(item.gid))
+        .sort((a, b) => a.date - b.date);
+      for (const item of fresh) {
+        await handlePatchItem(feed, item);
+        remember(item);
+      }
+    } catch (error) {
+      console.error(`Patch notes check failed for ${feed.name}:`, error.message);
+    }
+  }
+}
+
+async function handlePatchItem(feed, item) {
+  const text = item.contents.replace(/\[\/?(p|b|i|u|h\d|list|olist|\*|url[^\]]*|img[^\]]*|previewyoutube[^\]]*|table|tr|td|th|hr)\]/gi, " ").replace(/\{STEAM_CLAN_IMAGE\}[^\s]*/g, "").replace(/\s+/g, " ").trim();
+  const response = await anthropic.messages.create({
+    model: MODEL,
+    max_tokens: 800,
+    output_config: { effort: "low" },
+    system: "You summarise official game announcements for a Discord gaming chat, in British English.\n" +
+      "If the announcement contains actual game changes (patch notes, fixes, balance changes, new content, matchmaking changes or tests), reply with one short overview sentence, then up to 6 bullet points ('- ') with the most important changes. No heading, no preamble, under 900 characters.\n" +
+      "If it has no game changes (a trailer, sale, event teaser, anti-cheat ban report, stream or merch), reply with exactly: SKIP",
+    messages: [{ role: "user", content: `Game: ${feed.name}\nTitle: ${item.title}\n\n${text.slice(0, 20_000)}` }],
+  });
+  const cost = response.usage.input_tokens * PRICE_IN + response.usage.output_tokens * PRICE_OUT;
+  spentUsd += cost;
+  const summary = response.content.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+  if (!summary || summary === "SKIP" || response.stop_reason === "refusal") {
+    console.log(`[patch] ${feed.name}: skipped "${item.title}" (not game changes), ~$${cost.toFixed(5)}`);
+    return false;
+  }
+
+  const link = `https://store.steampowered.com/news/app/${feed.appId}/view/${item.gid}`;
+  // Sending a message reopens a forum post that Discord has auto-archived.
+  const post = await discord.channels.fetch(feed.postId);
+  const sent = await post.send({ content: `📰 **${item.title}**\n${summary}\n-# Full notes: <${link}>`.slice(0, 2000) });
+  if (GAMES_CHAT_ID) {
+    const chat = await discord.channels.fetch(GAMES_CHAT_ID);
+    await chat.send(`📰 New **${feed.name}** patch notes: ${item.title} → ${sent.url}`);
+  }
+  lastPatch = `${feed.name}: ${item.title} (${new Date().toLocaleString("en-GB")})`;
+  writeStatus();
+  console.log(`[patch] ${feed.name}: posted "${item.title}", ~$${cost.toFixed(5)}`);
+  return true;
+}
+
+function readPatchState() {
+  try { return JSON.parse(fs.readFileSync(PATCH_STATE_FILE, "utf8")); } catch { return {}; }
+}
+function writePatchState(stateAll) {
+  try { fs.writeFileSync(PATCH_STATE_FILE, JSON.stringify(stateAll, null, 2)); } catch (e) { console.error("Couldn't save patch state:", e.message); }
+}
 
 discord.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.inGuild()) return;
@@ -216,6 +316,7 @@ ${row("Researched questions today", `${researchedToday} (max ${RESEARCH_PER_PERS
 ${row("Search budget today", `~$${searchSpentToday.toFixed(3)} of $${SEARCH_BUDGET_USD.toFixed(2)}`)}
 ${row("Spent since restart", `~$${spentUsd.toFixed(4)}`)}
 ${row("Running since", startedAt.toLocaleString("en-GB"))}
+${PATCH_FEEDS.length ? row("Patch notes", `${PATCH_FEEDS.map((f) => f.name).join(", ")}; last posted: ${lastPatch || "none since restart"}`) : ""}
 ${lastError ? row("Last error", lastError) : ""}
 </table>
 <p class=note>Keys are set in Umbrel: right-click the app &gt; Settings &gt; Advanced &gt; Custom variables, service <code>bot</code>: <code>ANTHROPIC_API_KEY</code> and <code>DISCORD_BOT_TOKEN</code>. Restart the app after changing them.</p>

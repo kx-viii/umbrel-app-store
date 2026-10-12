@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: home-discord-assistant
 category: social
 name: Discord Assistant
-version: "1.2.0"
+version: "1.3.0"
 tagline: A Claude-powered helper for your Discord server
 icon: https://raw.githubusercontent.com/kx-viii/umbrel-app-store/main/home-discord-assistant/icon.png
 description: >-
@@ -13,12 +13,13 @@ description: >-
   Set these in Settings > Advanced > Custom variables for the service "bot", then restart the app:
   ANTHROPIC_API_KEY (from platform.claude.com) and DISCORD_BOT_TOKEN (from the Discord Developer Portal) are required.
   Optional: ASK_CHANNEL_ID (the channel it answers everything in), SERVER_INFO (a few sentences about your server),
-  OWNER_NAME (who people should tell when something's wrong) and MODEL.
+  OWNER_NAME (who people should tell when something's wrong), PERSONALITY (how it talks), MODEL,
+  and for patch notes PATCH_FEEDS (steamAppId:forumPostId:Name, separated by ;) and GAMES_CHAT_ID (where the heads-up goes).
 
 
   Limits: 15 seconds between questions per person and 200 questions a day. It researches online only when a question needs current information: up to 3 searches and 2 page checks per question (about 2-3 cents), from a daily budget of 15 cents and at most 3 researched questions per person a day. When the API credit runs out it says so in Discord.
   Opening the app shows its status, questions today and an estimate of what it has spent.
-releaseNotes: "Better web research: up to 3 searches and 2 page checks per question, paid from a daily search budget (15 cents a day, 3 researched questions per person)."
+releaseNotes: "Posts summarised patch notes for Steam games into a forum post, with a heads-up in a chat channel. New PERSONALITY setting for how the bot talks."
 developer: home
 website: https://github.com/kx-viii/umbrel-app-store
 dependencies: []
