@@ -26,18 +26,23 @@ const ASK_CHANNEL_ID = process.env.ASK_CHANNEL_ID || "";
 const SERVER_INFO = process.env.SERVER_INFO || "";
 const OWNER_NAME = process.env.OWNER_NAME || "the server owner";
 const STATUS_FILE = process.env.STATUS_FILE;
-const MAX_TOKENS = 1024;
+const MAX_TOKENS = 2000;
 const HISTORY_MESSAGES = 10;    // recent channel messages sent as context
 const USER_COOLDOWN_MS = 15_000; // per person, between questions
 const DAILY_LIMIT = 200;         // questions per day across the whole server
-const SEARCHES_PER_DAY = 10;     // web searches per day across the whole server
-const SEARCHES_PER_PERSON = 3;   // web searches per person per day
-// Haiku 5.5 prices in USD (only used for the running cost estimate in the log).
+// Web research: up to 3 searches and 2 page fetches per question, paid from a daily budget.
+const SEARCH_BUDGET_USD = 0.15;  // per day, across the whole server (worst case ~$4.50/month)
+const RESEARCH_PER_PERSON = 3;   // researched questions per person per day
+const RESEARCH_TOOLS = [
+  { type: "web_search_20250305", name: "web_search", max_uses: 3 }, // the dynamic-filtering version doesn't run on Haiku 5.5
+  { type: "web_fetch_20250910", name: "web_fetch", max_uses: 2, max_content_tokens: 8000 },
+];
+// Haiku 5.5 prices in USD (only used for the running cost estimate and the search budget).
 const PRICE_IN = 0.10 / 1e6;
 const PRICE_OUT = 0.50 / 1e6;
 const PRICE_SEARCH = 0.01;
 
-const SEARCH_ON = `\n- You can search the web once per question. Only search when the answer depends on recent or changing information (patch notes, release dates, news, prices, events) and you aren't confident without it. Otherwise answer from what you know.`;
+const SEARCH_ON = `\n- You can research online: up to 3 web searches, and you can open up to 2 pages with web_fetch to check a source (such as the official site, patch notes or a channel page). Only do this when the answer depends on recent or changing information (patch notes, release dates, news, results, new uploads, prices) and you aren't confident without it; otherwise answer from what you know. Prefer primary sources, and if you still can't confirm something, say so.`;
 const SEARCH_OFF = `\n- Web search isn't available right now (today's search limit is used up). If the question needs current information, answer from what you know and say you couldn't check online today.`;
 
 function systemPrompt(botName, serverName, canSearch) {
@@ -62,8 +67,9 @@ const discord = new Client({
 const lastAsked = new Map(); // userId -> timestamp
 let day = new Date().toDateString();
 let askedToday = 0;
-let searchesToday = 0;
-const searchesByPerson = new Map(); // userId -> searches today
+let searchSpentToday = 0;             // USD spent today on questions that used web research
+let researchedToday = 0;
+const researchByPerson = new Map(); // userId -> researched questions today
 let spentUsd = 0;
 let state = "Starting";
 let lastError = "";
@@ -84,7 +90,7 @@ discord.on(Events.MessageCreate, async (message) => {
 
   // Daily cap, reset at midnight.
   const today = new Date().toDateString();
-  if (today !== day) { day = today; askedToday = 0; searchesToday = 0; searchesByPerson.clear(); }
+  if (today !== day) { day = today; askedToday = 0; searchSpentToday = 0; researchedToday = 0; researchByPerson.clear(); }
   if (askedToday >= DAILY_LIMIT) {
     return message.reply("I've hit my question limit for today. Try again tomorrow!");
   }
@@ -103,14 +109,13 @@ discord.on(Events.MessageCreate, async (message) => {
 
   try {
     const context = await recentHistory(message);
-    const personSearches = searchesByPerson.get(message.author.id) ?? 0;
-    const canSearch = searchesToday < SEARCHES_PER_DAY && personSearches < SEARCHES_PER_PERSON;
+    const personResearched = researchByPerson.get(message.author.id) ?? 0;
+    const canSearch = searchSpentToday < SEARCH_BUDGET_USD && personResearched < RESEARCH_PER_PERSON;
     const response = await anthropic.messages.create({
       model: MODEL,
       max_tokens: MAX_TOKENS,
-      output_config: { effort: "low" },
-      // The basic search tool: the dynamic-filtering version doesn't run on Haiku 5.5.
-      ...(canSearch && { tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 1 }] }),
+      output_config: { effort: "medium" },
+      ...(canSearch && { tools: RESEARCH_TOOLS }),
       system: systemPrompt(discord.user.username, message.guild.name, canSearch),
       messages: [{
         role: "user",
@@ -119,14 +124,18 @@ discord.on(Events.MessageCreate, async (message) => {
           (context ? `Recent messages (oldest first):\n${context}\n\n` : "") +
           `Latest message, from ${displayName(message)}:\n${question}`,
       }],
-    });
+    }, canSearch ? { headers: { "anthropic-beta": "web-fetch-2025-09-10" } } : undefined);
 
     const searches = response.usage.server_tool_use?.web_search_requests ?? 0;
-    searchesToday += searches;
-    if (searches) searchesByPerson.set(message.author.id, personSearches + searches);
+    const fetches = response.usage.server_tool_use?.web_fetch_requests ?? 0;
     const cost = response.usage.input_tokens * PRICE_IN + response.usage.output_tokens * PRICE_OUT + searches * PRICE_SEARCH;
     spentUsd += cost;
-    console.log(`[${new Date().toLocaleTimeString()}] ${message.author.tag}: ${response.usage.input_tokens} in / ${response.usage.output_tokens} out, ${searches} search, ~$${cost.toFixed(5)} (session ~$${spentUsd.toFixed(4)}, ${askedToday} questions / ${searchesToday} searches today)`);
+    if (searches || fetches) {
+      searchSpentToday += cost;
+      researchedToday++;
+      researchByPerson.set(message.author.id, personResearched + 1);
+    }
+    console.log(`[${new Date().toLocaleTimeString()}] ${message.author.tag}: ${response.usage.input_tokens} in / ${response.usage.output_tokens} out, ${searches} search / ${fetches} fetch, ~$${cost.toFixed(5)} (session ~$${spentUsd.toFixed(4)}; today ${askedToday} questions, search budget $${searchSpentToday.toFixed(3)} of $${SEARCH_BUDGET_USD})`);
     writeStatus();
 
     if (response.stop_reason === "refusal") {
@@ -203,7 +212,8 @@ function writeStatus() {
 ${row("Status", state)}
 ${row("Model", MODEL)}
 ${row("Questions today", `${askedToday} of ${DAILY_LIMIT}`)}
-${row("Web searches today", `${searchesToday} of ${SEARCHES_PER_DAY} (max ${SEARCHES_PER_PERSON} per person)`)}
+${row("Researched questions today", `${researchedToday} (max ${RESEARCH_PER_PERSON} per person)`)}
+${row("Search budget today", `~$${searchSpentToday.toFixed(3)} of $${SEARCH_BUDGET_USD.toFixed(2)}`)}
 ${row("Spent since restart", `~$${spentUsd.toFixed(4)}`)}
 ${row("Running since", startedAt.toLocaleString("en-GB"))}
 ${lastError ? row("Last error", lastError) : ""}

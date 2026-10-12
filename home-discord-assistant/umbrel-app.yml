@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: home-discord-assistant
 category: social
 name: Discord Assistant
-version: "1.1.0"
+version: "1.2.0"
 tagline: A Claude-powered helper for your Discord server
 icon: https://raw.githubusercontent.com/kx-viii/umbrel-app-store/main/home-discord-assistant/icon.png
 description: >-
@@ -16,9 +16,9 @@ description: >-
   OWNER_NAME (who people should tell when something's wrong) and MODEL.
 
 
-  Limits: 15 seconds between questions per person and 200 questions a day. It searches the web only when a question needs current information: one search per question, at most 10 a day and 3 per person (about 1 cent each). When the API credit runs out it says so in Discord.
+  Limits: 15 seconds between questions per person and 200 questions a day. It researches online only when a question needs current information: up to 3 searches and 2 page checks per question (about 2-3 cents), from a daily budget of 15 cents and at most 3 researched questions per person a day. When the API credit runs out it says so in Discord.
   Opening the app shows its status, questions today and an estimate of what it has spent.
-releaseNotes: "Can search the web when a question needs current information (at most 10 searches a day, 3 per person)."
+releaseNotes: "Better web research: up to 3 searches and 2 page checks per question, paid from a daily search budget (15 cents a day, 3 researched questions per person)."
 developer: home
 website: https://github.com/kx-viii/umbrel-app-store
 dependencies: []
