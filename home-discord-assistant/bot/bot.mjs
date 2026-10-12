@@ -24,7 +24,7 @@ import { fileURLToPath } from "node:url";
 import Anthropic from "@anthropic-ai/sdk";
 import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, EmbedBuilder, Events, GatewayIntentBits,
-  OverwriteType, Partials, PermissionFlagsBits,
+  OverwriteType, Partials, PermissionFlagsBits, Routes, SlashCommandBuilder,
 } from "discord.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -91,6 +91,24 @@ const REQUEST_TOOL = {
   strict: true,
 };
 const REQUESTS_ON = `\n- You can't change the server yourself. If someone asks for a change (add or remove a game, change server info, channels, roles), call request_change so the staff can approve it.`;
+// Maintenance mode: staff can switch it on/off with /maintenance or by asking the bot.
+// On: members lose access to every channel (what's removed is recorded), @everyone loses View Channels,
+// and only the maintenance channel is visible. Off: everything recorded is put back exactly.
+const MAINT_CHANNEL_ID = process.env.MAINT_CHANNEL_ID || "";
+const MAINT_FILE = path.join(here, "maintenance.json");
+const LOCK_ROLE_IDS = () => MEMBER_ROLE_IDS.filter((id) => id !== STAFF_ROLE_ID); // member roles hidden during maintenance
+const MAINT_TOOL = {
+  name: "set_maintenance",
+  description: "Turn the server's maintenance mode on or off, when a staff member asks to (e.g. 'turn off maintenance mode', 'put the server in maintenance').",
+  input_schema: {
+    type: "object",
+    properties: { mode: { type: "string", enum: ["on", "off"] } },
+    required: ["mode"],
+    additionalProperties: false,
+  },
+  strict: true,
+};
+const MAINT_ON = `\n- This person is staff. If they ask to turn maintenance mode on or off, call set_maintenance.`;
 // Game tags: every post in the games forum gets a ping role; reacting with the post's title emoji
 // (or TAG_EMOJI if it has none) on its first message gives you the role, removing it takes it away.
 const GAMES_FORUM_ID = process.env.GAMES_FORUM_ID || "";
@@ -208,6 +226,7 @@ discord.once(Events.ClientReady, (c) => {
   console.log(`Logged in as ${c.user.tag}. Model ${MODEL}, ask channel ${ASK_CHANNEL_ID || "none (mentions only)"}.`);
   if (ROOMS_CATEGORY_ID) setInterval(cleanUpRooms, 60_000);
   if (GAMES_FORUM_ID) setupAllGameTags().catch((e) => console.error("Game tag setup failed:", e.message));
+  if (MAINT_CHANNEL_ID && STAFF_ROLE_ID) registerCommands().catch((e) => console.error("Couldn't register /maintenance:", e.message));
   if (PATCH_FEEDS.length) {
     console.log(`Patch notes for: ${PATCH_FEEDS.map((f) => f.name).join(", ")} (checking every ${PATCH_CHECK_MS / 60_000} min)`);
     setTimeout(checkPatchNotes, 30_000);
@@ -455,6 +474,77 @@ async function applyRequest(guild, request) {
   }
   return null; // "other": staff do it themselves
 }
+
+// ---- Maintenance mode -------------------------------------------------------
+function loadMaintenance() {
+  try { return JSON.parse(fs.readFileSync(MAINT_FILE, "utf8")); } catch { return { on: false, removed: [] }; }
+}
+function saveMaintenance(state) {
+  try { fs.writeFileSync(MAINT_FILE, JSON.stringify(state, null, 2)); } catch (e) { console.error("Couldn't save maintenance state:", e.message); }
+}
+const isStaff = (member) => Boolean(member?.roles.cache.has(STAFF_ROLE_ID));
+
+// /maintenance, only visible to people who can manage roles (the staff role can).
+async function registerCommands() {
+  const command = new SlashCommandBuilder()
+    .setName("maintenance")
+    .setDescription("Turn maintenance mode on or off")
+    .addStringOption((o) => o.setName("mode").setDescription("on or off").setRequired(true).addChoices({ name: "on", value: "on" }, { name: "off", value: "off" }))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles);
+  const channel = await discord.channels.fetch(MAINT_CHANNEL_ID);
+  await discord.rest.put(Routes.applicationGuildCommands(discord.user.id, channel.guildId), { body: [command.toJSON()] });
+}
+
+async function setMaintenance(guild, mode, by) {
+  const state = loadMaintenance();
+  const everyone = guild.roles.everyone;
+  const maintChannel = await guild.channels.fetch(MAINT_CHANNEL_ID);
+  if (mode === "on") {
+    if (state.on) return "Maintenance mode is already on.";
+    const removed = [];
+    await guild.channels.fetch();
+    for (const channel of guild.channels.cache.values()) {
+      if (channel.isThread() || channel.id === MAINT_CHANNEL_ID) continue;
+      for (const roleId of LOCK_ROLE_IDS()) {
+        const ow = channel.permissionOverwrites.cache.get(roleId);
+        if (!ow || !ow.allow.has(PermissionFlagsBits.ViewChannel)) continue;
+        removed.push({ channelId: channel.id, roleId, allow: ow.allow.bitfield.toString(), deny: ow.deny.bitfield.toString() });
+        await ow.delete(`Maintenance mode on (${by})`);
+      }
+    }
+    // Save what was removed straight away, so a crash part-way can still be undone.
+    saveMaintenance({ on: true, removed, since: Date.now(), by });
+    await everyone.setPermissions(everyone.permissions.remove(PermissionFlagsBits.ViewChannel), `Maintenance mode on (${by})`);
+    await maintChannel.permissionOverwrites.edit(everyone, { ViewChannel: true }, { reason: "Maintenance mode on" });
+    staffAlert("maintenance", `🚧 Maintenance mode **on** (${by}). Only staff can see the server.`, 0);
+    return "Maintenance mode is on. Only staff can see the server now.";
+  }
+  if (!state.on && everyone.permissions.has(PermissionFlagsBits.ViewChannel)) return "Maintenance mode is already off.";
+  for (const r of state.removed ?? []) {
+    await discord.rest.put(Routes.channelPermission(r.channelId, r.roleId), { body: { type: 0, allow: r.allow, deny: r.deny }, reason: `Maintenance mode off (${by})` })
+      .catch((e) => console.error(`Couldn't restore access on ${r.channelId}:`, e.message));
+  }
+  await everyone.setPermissions(everyone.permissions.add(PermissionFlagsBits.ViewChannel), `Maintenance mode off (${by})`);
+  await maintChannel.permissionOverwrites.edit(STAFF_ROLE_ID, { ViewChannel: true }, { reason: "Maintenance mode off" });
+  await maintChannel.permissionOverwrites.edit(everyone, { ViewChannel: false }, { reason: "Maintenance mode off" });
+  saveMaintenance({ on: false, removed: [] });
+  staffAlert("maintenance", `✅ Maintenance mode **off** (${by}). The server is open again.`, 0);
+  return "Maintenance mode is off. The server is open again.";
+}
+
+discord.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== "maintenance") return;
+  if (!isStaff(interaction.member)) return interaction.reply({ content: "Only staff can do that.", ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  try {
+    const result = await setMaintenance(interaction.guild, interaction.options.getString("mode"), interaction.member.displayName);
+    await interaction.editReply(result);
+  } catch (error) {
+    console.error("Maintenance toggle failed:", error.message);
+    await interaction.editReply(`That didn't work: ${error.message}`);
+  }
+  writeStatus();
+});
 
 discord.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isButton() || !interaction.customId.startsWith("req:")) return;
@@ -708,13 +798,14 @@ discord.on(Events.MessageCreate, async (message) => {
     const canSearch = searchSpentToday < SEARCH_BUDGET_USD && personResearched < RESEARCH_PER_PERSON;
     const canMakeRooms = Boolean(ROOMS_CATEGORY_ID) && isMember(message.member);
     const canRequest = Boolean(STAFF_CHANNEL_ID && STAFF_ROLE_ID);
-    const tools = [...(canSearch ? RESEARCH_TOOLS : []), ...(canMakeRooms ? [ROOM_TOOL] : []), ...(canRequest ? [REQUEST_TOOL] : [])];
+    const canMaintain = Boolean(MAINT_CHANNEL_ID) && isStaff(message.member);
+    const tools = [...(canSearch ? RESEARCH_TOOLS : []), ...(canMakeRooms ? [ROOM_TOOL] : []), ...(canRequest ? [REQUEST_TOOL] : []), ...(canMaintain ? [MAINT_TOOL] : [])];
     const response = await anthropic.messages.create({
       model: MODEL,
       max_tokens: MAX_TOKENS,
       output_config: { effort: "medium" },
       ...(tools.length && { tools }),
-      system: systemPrompt(discord.user.username, message.guild.name, canSearch) + (ROOMS_CATEGORY_ID ? (canMakeRooms ? ROOMS_ON : ROOMS_OFF) : "") + (canRequest ? REQUESTS_ON : ""),
+      system: systemPrompt(discord.user.username, message.guild.name, canSearch) + (ROOMS_CATEGORY_ID ? (canMakeRooms ? ROOMS_ON : ROOMS_OFF) : "") + (canRequest ? REQUESTS_ON : "") + (canMaintain ? MAINT_ON : ""),
       messages: [{
         role: "user",
         content:
@@ -743,6 +834,12 @@ discord.on(Events.MessageCreate, async (message) => {
     // A game room request: make the room and announce it ourselves; no second Claude call needed.
     const roomCall = response.content.find((b) => b.type === "tool_use" && b.name === ROOM_TOOL.name);
     if (roomCall) return createGameRoom(message, roomCall.input);
+    const maintCall = response.content.find((b) => b.type === "tool_use" && b.name === MAINT_TOOL.name);
+    if (maintCall && canMaintain) {
+      const result = await setMaintenance(message.guild, maintCall.input.mode, displayName(message)).catch((e) => `That didn't work: ${e.message}`);
+      writeStatus();
+      return message.reply(result);
+    }
     const requestCall = response.content.find((b) => b.type === "tool_use" && b.name === REQUEST_TOOL.name);
     if (requestCall) return submitChangeRequest(message, requestCall.input);
     const textBlocks = response.content.filter((b) => b.type === "text");
@@ -823,6 +920,7 @@ function writeStatus() {
 </head><body><main><h1>${title}</h1><table>
 ${row("Status", state)}
 ${row("Model", MODEL)}
+${MAINT_CHANNEL_ID ? row("Maintenance mode", loadMaintenance().on ? "on" : "off") : ""}
 ${row("Questions today", `${askedToday} of ${DAILY_LIMIT}`)}
 ${row("Researched questions today", `${researchedToday} (max ${RESEARCH_PER_PERSON} per person)`)}
 ${row("Search budget today", `~$${searchSpentToday.toFixed(3)} of $${SEARCH_BUDGET_USD.toFixed(2)}`)}
