@@ -255,7 +255,7 @@ const gameNameFromPost = (name) => name.replace(/^[^\p{L}\p{N}]+/u, "").trim();
 const emojiFromPost = (name) => name.match(/^\p{Extended_Pictographic}(?:️|‍\p{Extended_Pictographic}|\p{Emoji_Modifier})*/u)?.[0] ?? TAG_EMOJI;
 // Discord sometimes drops the invisible variation selector, so compare without it.
 const sameEmoji = (a, b) => a?.replace(/️/g, "") === b?.replace(/️/g, "");
-const tagNote = (emoji, roleName) => `-# React ${emoji} on this post to get the @${roleName} tag, so you get pinged when people want to play. Remove it to stop.`;
+const tagNote = (emoji, roleName) => `-# React ${emoji} on this post to get the @${roleName} tag, to follow this post and get pinged when people want to play. Remove it to stop.`;
 
 async function setupAllGameTags() {
   const forum = await discord.channels.fetch(GAMES_FORUM_ID);
@@ -327,6 +327,13 @@ async function onTagReaction(reaction, user, add) {
   }
   if (add) await member.roles.add(entry.roleId, "Picked up a game tag").catch((e) => console.error("Tag add failed:", e.message));
   else await member.roles.remove(entry.roleId, "Dropped a game tag").catch((e) => console.error("Tag remove failed:", e.message));
+
+  // Also follow (or unfollow) the post for them, so it shows in their channel list under the forum.
+  const thread = reaction.message.channel;
+  if (!thread?.isThread?.()) return;
+  if (thread.archived) await thread.setArchived(false, "Reopening so a member can follow it").catch(() => {});
+  if (add) await thread.members.add(user.id).catch((e) => console.error("Follow failed:", e.message));
+  else await thread.members.remove(user.id).catch((e) => console.error("Unfollow failed (needs Manage Threads):", e.message));
 }
 
 discord.on(Events.ThreadCreate, async (thread, newlyCreated) => {
