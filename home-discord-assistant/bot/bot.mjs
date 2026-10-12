@@ -24,7 +24,7 @@ import { fileURLToPath } from "node:url";
 import Anthropic from "@anthropic-ai/sdk";
 import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, EmbedBuilder, Events, GatewayIntentBits,
-  OverwriteType, Partials, PermissionFlagsBits, Routes, SlashCommandBuilder,
+  MessageFlags, OverwriteType, Partials, PermissionFlagsBits, Routes, SlashCommandBuilder,
 } from "discord.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -109,6 +109,25 @@ const MAINT_TOOL = {
   strict: true,
 };
 const MAINT_ON = `\n- This person is staff. If they ask to turn maintenance mode on or off, call set_maintenance.`;
+// Server updates: staff give rough notes (/update, or asking the bot); the bot writes a versioned post,
+// previews it in the staff channel with Post/Discard buttons, and posts it silently (no pings, no notification).
+const UPDATES_CHANNEL_ID = process.env.UPDATES_CHANNEL_ID || "";
+const UPDATES_FILE = path.join(here, "updates.json"); // { version, drafts: { id: { text, version } } }
+const UPDATE_TOOL = {
+  name: "post_server_update",
+  description: "Draft a server update post from a staff member's notes, when they ask to post, write or announce a server update or changelog.",
+  input_schema: {
+    type: "object",
+    properties: {
+      notes: { type: "string", description: "Everything they said changed, in their words." },
+      bump: { type: "string", enum: ["minor", "major"], description: "major only if they say it's a big/major update or a new version number" },
+    },
+    required: ["notes", "bump"],
+    additionalProperties: false,
+  },
+  strict: true,
+};
+const UPDATE_ON = `\n- This person is staff. If they ask to post a server update or changelog, call post_server_update with their notes.`;
 // Game tags: every post in the games forum gets a ping role; reacting with the post's title emoji
 // (or TAG_EMOJI if it has none) on its first message gives you the role, removing it takes it away.
 const GAMES_FORUM_ID = process.env.GAMES_FORUM_ID || "";
@@ -482,6 +501,69 @@ async function applyRequest(guild, request) {
   return null; // "other": staff do it themselves
 }
 
+// ---- Server updates ---------------------------------------------------------
+function loadUpdates() {
+  try { return JSON.parse(fs.readFileSync(UPDATES_FILE, "utf8")); } catch { return { version: "0.0", drafts: {} }; }
+}
+function saveUpdates(u) {
+  try { fs.writeFileSync(UPDATES_FILE, JSON.stringify(u, null, 2)); } catch (e) { console.error("Couldn't save updates:", e.message); }
+}
+function nextVersion(current, bump) {
+  const [major, minor] = current.split(".").map(Number);
+  return bump === "major" ? `${major + 1}.0` : `${major}.${minor + 1}`;
+}
+
+async function draftServerUpdate(notes, bump, by) {
+  const updates = loadUpdates();
+  const version = nextVersion(updates.version, bump);
+  const response = await anthropic.messages.create({
+    model: MODEL, max_tokens: 900, output_config: { effort: "low" },
+    system: "You write short server update posts for a Discord server, in plain, direct British English. Format:\n" +
+      `## v${version}: <a short title>\n` +
+      "**What's new**\n- one line per change, biggest first\n" +
+      "Then, only if something works differently now, **How to use it** with one line per tip.\n" +
+      "Only include what's in the notes; don't invent features. No greeting, no sign-off, no @ mentions of people or roles. Under 1500 characters. Reply with the post only.",
+    messages: [{ role: "user", content: notes }],
+  });
+  addSpend(response.usage.input_tokens * PRICE_IN + response.usage.output_tokens * PRICE_OUT);
+  const text = response.content.filter((b) => b.type === "text").map((b) => b.text).join("").trim().slice(0, 1900);
+  const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  updates.drafts[id] = { text, version, by };
+  saveUpdates(updates);
+  const staff = await discord.channels.fetch(STAFF_CHANNEL_ID);
+  await staff.send({
+    content: `🗒️ **Server update draft** from ${by} (posts silently to <#${UPDATES_CHANNEL_ID}>):\n\n${text}`.slice(0, 2000),
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`upd:post:${id}`).setLabel("Post").setEmoji("📣").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`upd:discard:${id}`).setLabel("Discard").setStyle(ButtonStyle.Secondary),
+    )],
+    allowedMentions: { parse: [] },
+  });
+  return `Draft v${version} is in staff chat. Press Post when it looks right.`;
+}
+
+async function handleUpdateButton(interaction) {
+  if (!isStaff(interaction.member)) return interaction.reply({ content: "Only staff can do that.", ephemeral: true });
+  const [, action, id] = interaction.customId.split(":");
+  const updates = loadUpdates();
+  const draft = updates.drafts[id];
+  if (!draft) return interaction.reply({ content: "That draft has already been dealt with.", ephemeral: true });
+  await interaction.deferUpdate();
+  let outcome;
+  if (action === "post") {
+    const channel = await discord.channels.fetch(UPDATES_CHANNEL_ID);
+    // Silent: no pings at all, and no notification sound for anyone.
+    await channel.send({ content: draft.text, allowedMentions: { parse: [] }, flags: MessageFlags.SuppressNotifications });
+    updates.version = draft.version;
+    outcome = `📣 Posted as v${draft.version} by ${interaction.member.displayName}.`;
+  } else {
+    outcome = `Discarded by ${interaction.member.displayName}.`;
+  }
+  delete updates.drafts[id];
+  saveUpdates(updates);
+  await interaction.message.edit({ content: `${interaction.message.content}\n**${outcome}**`.slice(0, 2000), components: [] }).catch(() => {});
+}
+
 // ---- Maintenance mode -------------------------------------------------------
 function loadMaintenance() {
   try { return JSON.parse(fs.readFileSync(MAINT_FILE, "utf8")); } catch { return { on: false, removed: [] }; }
@@ -498,8 +580,15 @@ async function registerCommands() {
     .setDescription("Turn maintenance mode on or off")
     .addStringOption((o) => o.setName("mode").setDescription("on or off").setRequired(true).addChoices({ name: "on", value: "on" }, { name: "off", value: "off" }))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles);
+  const update = new SlashCommandBuilder()
+    .setName("update")
+    .setDescription("Draft a server update post from your notes (previewed in staff chat first)")
+    .addStringOption((o) => o.setName("notes").setDescription("What changed, rough notes are fine").setRequired(true))
+    .addStringOption((o) => o.setName("bump").setDescription("minor (default) or major version").addChoices({ name: "minor", value: "minor" }, { name: "major", value: "major" }))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles);
   const channel = await discord.channels.fetch(MAINT_CHANNEL_ID);
-  await discord.rest.put(Routes.applicationGuildCommands(discord.user.id, channel.guildId), { body: [command.toJSON()] });
+  const commands = [command.toJSON(), ...(UPDATES_CHANNEL_ID ? [update.toJSON()] : [])];
+  await discord.rest.put(Routes.applicationGuildCommands(discord.user.id, channel.guildId), { body: commands });
 }
 
 async function setMaintenance(guild, mode, by) {
@@ -535,11 +624,18 @@ async function setMaintenance(guild, mode, by) {
   await maintChannel.permissionOverwrites.edit(STAFF_ROLE_ID, { ViewChannel: true }, { reason: "Maintenance mode off" });
   await maintChannel.permissionOverwrites.edit(everyone, { ViewChannel: false }, { reason: "Maintenance mode off" });
   saveMaintenance({ on: false, removed: [] });
-  staffAlert("maintenance", `✅ Maintenance mode **off** (${by}). The server is open again.`, 0);
+  staffAlert("maintenance", `✅ Maintenance mode **off** (${by}). The server is open again.${UPDATES_CHANNEL_ID ? " Post what changed with `/update`." : ""}`, 0);
   return "Maintenance mode is off. The server is open again.";
 }
 
 discord.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.isChatInputCommand() && interaction.commandName === "update") {
+    if (!isStaff(interaction.member)) return interaction.reply({ content: "Only staff can do that.", ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
+    const result = await draftServerUpdate(interaction.options.getString("notes"), interaction.options.getString("bump") ?? "minor", interaction.member.displayName)
+      .catch((e) => `That didn't work: ${e.message}`);
+    return interaction.editReply(result);
+  }
   if (!interaction.isChatInputCommand() || interaction.commandName !== "maintenance") return;
   if (!isStaff(interaction.member)) return interaction.reply({ content: "Only staff can do that.", ephemeral: true });
   await interaction.deferReply({ ephemeral: true });
@@ -554,6 +650,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 });
 
 discord.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.isButton() && interaction.customId.startsWith("upd:")) return handleUpdateButton(interaction);
   if (!interaction.isButton() || !interaction.customId.startsWith("req:")) return;
   const [, action, id] = interaction.customId.split(":");
   if (!interaction.member?.roles.cache.has(STAFF_ROLE_ID)) {
@@ -806,13 +903,14 @@ discord.on(Events.MessageCreate, async (message) => {
     const canMakeRooms = Boolean(ROOMS_CATEGORY_ID) && isMember(message.member);
     const canRequest = Boolean(STAFF_CHANNEL_ID && STAFF_ROLE_ID);
     const canMaintain = Boolean(MAINT_CHANNEL_ID) && isStaff(message.member);
-    const tools = [...(canSearch ? RESEARCH_TOOLS : []), ...(canMakeRooms ? [ROOM_TOOL] : []), ...(canRequest ? [REQUEST_TOOL] : []), ...(canMaintain ? [MAINT_TOOL] : [])];
+    const canUpdate = Boolean(UPDATES_CHANNEL_ID && STAFF_CHANNEL_ID) && isStaff(message.member);
+    const tools = [...(canSearch ? RESEARCH_TOOLS : []), ...(canMakeRooms ? [ROOM_TOOL] : []), ...(canRequest ? [REQUEST_TOOL] : []), ...(canMaintain ? [MAINT_TOOL] : []), ...(canUpdate ? [UPDATE_TOOL] : [])];
     const response = await anthropic.messages.create({
       model: MODEL,
       max_tokens: MAX_TOKENS,
       output_config: { effort: "medium" },
       ...(tools.length && { tools }),
-      system: systemPrompt(discord.user.username, message.guild.name, canSearch) + (ROOMS_CATEGORY_ID ? (canMakeRooms ? ROOMS_ON : ROOMS_OFF) : "") + (canRequest ? REQUESTS_ON : "") + (canMaintain ? MAINT_ON : ""),
+      system: systemPrompt(discord.user.username, message.guild.name, canSearch) + (ROOMS_CATEGORY_ID ? (canMakeRooms ? ROOMS_ON : ROOMS_OFF) : "") + (canRequest ? REQUESTS_ON : "") + (canMaintain ? MAINT_ON : "") + (canUpdate ? UPDATE_ON : ""),
       messages: [{
         role: "user",
         content:
@@ -841,6 +939,11 @@ discord.on(Events.MessageCreate, async (message) => {
     // A game room request: make the room and announce it ourselves; no second Claude call needed.
     const roomCall = response.content.find((b) => b.type === "tool_use" && b.name === ROOM_TOOL.name);
     if (roomCall) return createGameRoom(message, roomCall.input);
+    const updateCall = response.content.find((b) => b.type === "tool_use" && b.name === UPDATE_TOOL.name);
+    if (updateCall && canUpdate) {
+      const result = await draftServerUpdate(updateCall.input.notes, updateCall.input.bump, displayName(message)).catch((e) => `That didn't work: ${e.message}`);
+      return message.reply(result);
+    }
     const maintCall = response.content.find((b) => b.type === "tool_use" && b.name === MAINT_TOOL.name);
     if (maintCall && canMaintain) {
       const result = await setMaintenance(message.guild, maintCall.input.mode, displayName(message)).catch((e) => `That didn't work: ${e.message}`);
