@@ -46,6 +46,12 @@ const PATCH_FEEDS = (process.env.PATCH_FEEDS || "").split(";").map((s) => s.trim
 const GAMES_CHAT_ID = process.env.GAMES_CHAT_ID || "";
 const PATCH_CHECK_MS = 30 * 60_000;                      // how often to check Steam for new posts
 const PATCH_STATE_FILE = path.join(here, "patch-state.json"); // last Steam post handled per game
+// Live alerts: Twitch channels to watch. When one goes live, a notice goes in the games-forum post for the
+// game they're streaming, or the games chat if there isn't one. Uses decapi.me, which needs no Twitch keys.
+const STREAMERS = (process.env.STREAMERS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+const STREAM_CHECK_MS = 2 * 60_000;
+const STREAM_REANNOUNCE_MS = 10 * 60_000; // must be offline this long before a new "live" notice
+const STREAMS_FILE = path.join(here, "streams.json");
 // Game rooms: members can ask for a temporary voice channel for a game; it's deleted once empty for a while.
 const ROOMS_CATEGORY_ID = process.env.ROOMS_CATEGORY_ID || "";                // category the rooms go in
 const MEMBER_ROLE_IDS = (process.env.MEMBER_ROLE_IDS || "").split(",").map((s) => s.trim()).filter(Boolean); // who may make rooms
@@ -248,6 +254,11 @@ discord.once(Events.ClientReady, (c) => {
   if (ROOMS_CATEGORY_ID) setInterval(cleanUpRooms, 60_000);
   if (GAMES_FORUM_ID) setupAllGameTags().catch((e) => console.error("Game tag setup failed:", e.message));
   if (MAINT_CHANNEL_ID && STAFF_ROLE_ID) registerCommands().catch((e) => console.error("Couldn't register /maintenance:", e.message));
+  if (STREAMERS.length) {
+    console.log(`Live alerts for: ${STREAMERS.join(", ")}`);
+    setTimeout(checkStreams, 20_000);
+    setInterval(checkStreams, STREAM_CHECK_MS);
+  }
   if (PATCH_FEEDS.length) {
     console.log(`Patch notes for: ${PATCH_FEEDS.map((f) => f.name).join(", ")} (checking every ${PATCH_CHECK_MS / 60_000} min)`);
     setTimeout(checkPatchNotes, 30_000);
@@ -752,6 +763,56 @@ async function cleanUpRooms() {
     }
   }
   if (changed) saveRooms(rooms);
+}
+
+// ---- Live alerts ------------------------------------------------------------
+function loadStreams() {
+  try { return JSON.parse(fs.readFileSync(STREAMS_FILE, "utf8")); } catch { return {}; }
+}
+function saveStreams(s) {
+  try { fs.writeFileSync(STREAMS_FILE, JSON.stringify(s, null, 2)); } catch (e) { console.error("Couldn't save streams:", e.message); }
+}
+async function decapi(what, channel) {
+  const res = await fetch(`https://decapi.me/twitch/${what}/${encodeURIComponent(channel)}`, { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`decapi ${what} ${res.status}`);
+  return (await res.text()).trim();
+}
+
+async function checkStreams() {
+  const streams = loadStreams();
+  for (const channel of STREAMERS) {
+    try {
+      const uptime = await decapi("uptime", channel);
+      // "<name> is offline" when off; an uptime like "1 hour, 3 minutes" when live; anything else is an error.
+      const live = !/offline/i.test(uptime) && /\d/.test(uptime) && !/error|not found|invalid/i.test(uptime);
+      const s = streams[channel] ?? { live: false, offlineSince: 0 };
+      if (live && !s.live) {
+        s.live = true;
+        if (Date.now() - (s.offlineSince || 0) >= STREAM_REANNOUNCE_MS) await announceLive(channel);
+      } else if (!live && s.live) {
+        s.live = false;
+        s.offlineSince = Date.now();
+      }
+      streams[channel] = s;
+    } catch (error) {
+      console.error(`Live check failed for ${channel}:`, error.message);
+    }
+  }
+  saveStreams(streams);
+}
+
+async function announceLive(channel) {
+  const [game, title] = await Promise.all([decapi("game", channel).catch(() => ""), decapi("title", channel).catch(() => "")]);
+  const guild = (await discord.channels.fetch(GAMES_FORUM_ID || GAMES_CHAT_ID)).guild;
+  const post = game && GAMES_FORUM_ID ? await findGamePost(guild, game) : null;
+  const target = post ?? (GAMES_CHAT_ID ? await discord.channels.fetch(GAMES_CHAT_ID) : null);
+  if (!target) return;
+  const playing = game && !post ? ` playing **${game}**` : "";
+  await target.send({
+    content: `🔴 **${channel}** is live${playing}: *${title.replace(/[*_~`|]/g, "").slice(0, 200)}*\nhttps://twitch.tv/${channel}`,
+    allowedMentions: { parse: [] },
+  });
+  console.log(`[live] ${channel} is live (${game || "no game"}) -> ${post ? post.name : "games chat"}`);
 }
 
 // ---- Patch notes ------------------------------------------------------------
