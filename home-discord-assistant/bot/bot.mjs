@@ -133,7 +133,7 @@ const UPDATE_ON = `\n- This person is staff. If they ask to post a server update
 const GAMES_FORUM_ID = process.env.GAMES_FORUM_ID || "";
 const TAG_EMOJI = "🔔";                         // fallback when a post title has no emoji
 const TAGS_FILE = path.join(here, "tags.json"); // forum post id -> { roleId, emoji, noted, noteId }
-const MAX_TOKENS = 2000;
+const MAX_TOKENS = 1200;
 const HISTORY_MESSAGES = 10;    // recent channel messages sent as context
 const USER_COOLDOWN_MS = 15_000; // per person, between questions
 const DAILY_LIMIT = 200;         // questions per day across the whole server
@@ -142,14 +142,14 @@ const SEARCH_BUDGET_USD = 0.15;  // per day, across the whole server (worst case
 const RESEARCH_PER_PERSON = 3;   // researched questions per person per day
 const RESEARCH_TOOLS = [
   { type: "web_search_20250305", name: "web_search", max_uses: 3 }, // the dynamic-filtering version doesn't run on Haiku 5.5
-  { type: "web_fetch_20250910", name: "web_fetch", max_uses: 2, max_content_tokens: 8000 },
+  { type: "web_fetch_20250910", name: "web_fetch", max_uses: 2, max_content_tokens: 4000 },
 ];
 // Haiku 5.5 prices in USD (only used for the running cost estimate and the search budget).
 const PRICE_IN = 0.10 / 1e6;
 const PRICE_OUT = 0.50 / 1e6;
 const PRICE_SEARCH = 0.01;
 
-const SEARCH_ON = `\n- You can research online: up to 3 web searches, and you can open up to 2 pages with web_fetch to check a source (such as the official site, patch notes or a channel page). Only do this when the answer depends on recent or changing information (patch notes, release dates, news, results, new uploads, prices) and you aren't confident without it; otherwise answer from what you know. Prefer primary sources, and if you still can't confirm something, say so.`;
+const SEARCH_ON = `\n- You can research online: up to 3 web searches, and you can open up to 2 pages with web_fetch to check a source (such as the official site, patch notes or a channel page). Only do this when the answer depends on recent or changing information (patch notes, release dates, news, results, new uploads, prices) and you aren't confident without it; otherwise answer from what you know. Prefer primary sources. Stop as soon as you have the answer.`;
 const SEARCH_OFF = `\n- Web search isn't available right now (today's search limit is used up). If the question needs current information, answer from what you know and say you couldn't check online today.`;
 
 function systemPrompt(botName, serverName, canSearch) {
@@ -157,11 +157,13 @@ function systemPrompt(botName, serverName, canSearch) {
 ${SERVER_INFO ? `\nAbout this server: ${SERVER_INFO}\n` : ""}
 How to reply:
 - This is Discord chat. How to talk: ${PERSONALITY}
-- Use Discord markdown sparingly (bold, lists, code blocks for commands or configs). Facts, IPs and steps always stay clear and accurate, whatever the tone.
+- Be as short and precise as possible: one or two sentences unless they ask for detail. Give the answer and nothing else. Never mention how or where you looked, what you checked or didn't check, or when something was posted unless asked. No "I couldn't confirm", no suggestions to check elsewhere, no extra context, and never say the same thing twice.
+- For a lookup (a video, link, page, IP, date, score, price or patch), reply with just the answer on one line. Example: "what's MKBHD's latest video?" → **WTF is a Googlebook?** https://youtu.be/_0G4OG39XjI . Always include the plain link when the answer is a specific video, article or page.
+- Only add a caveat if the answer is probably wrong, in a few words.
+- Use Discord markdown sparingly (bold, lists, code blocks for commands or configs). Facts, IPs and steps always stay clear and accurate.
 - Never try to ping @everyone, @here or roles.
 - You'll be shown recent messages from the channel for context. Answer the latest question; use the earlier messages only to understand it.
-- You don't know the server's private details (IPs, passwords, whitelists, mod lists) unless they appear in the messages you're shown. Don't make them up; say who to ask instead.
-- If you're unsure or the answer may be out of date (game patches change fast), say so.${canSearch ? SEARCH_ON : SEARCH_OFF}`;
+- You don't know the server's private details (IPs, passwords, whitelists, mod lists) unless they appear in the messages you're shown. Don't make them up; say who to ask instead.${canSearch ? SEARCH_ON : SEARCH_OFF}`;
 }
 
 // ---- Clients ----------------------------------------------------------------
@@ -957,9 +959,7 @@ discord.on(Events.MessageCreate, async (message) => {
     let text = textBlocks.map((b) => b.text).join("").trim();
     if (!text) text = "I didn't come up with an answer for that. Try rephrasing?";
     if (response.stop_reason === "max_tokens") text += " …";
-    // Up to two sources from search citations, in small text, with <> so Discord doesn't embed them.
-    const sources = [...new Set(textBlocks.flatMap((b) => (b.citations ?? []).map((c) => c.url)).filter(Boolean))].slice(0, 2);
-    if (sources.length) text += `\n-# Sources: ${sources.map((url) => `<${url}>`).join(" ")}`;
+    // No separate "Sources" line: answers include the relevant link themselves, which keeps replies short.
     await sendReply(message, text);
   } catch (error) {
     console.error("Claude request failed:", error?.status, error?.type ?? "", error?.message);
