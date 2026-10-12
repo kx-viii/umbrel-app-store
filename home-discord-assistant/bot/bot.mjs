@@ -11,6 +11,7 @@
 //   PATCH_FEEDS                            Steam games to post patch notes for, as steamAppId:forumPostId:Name,
 //                                          separated by ";" (e.g. 1172470:123456789:Apex Legends)
 //   GAMES_CHAT_ID                          channel that gets a short "new patch notes" heads-up
+//   GAMES_FORUM_ID                         forum whose posts each get a game ping role, picked up by reacting 🔔
 //   ROOMS_CATEGORY_ID, MEMBER_ROLE_IDS     game rooms: the category temporary voice rooms go in, and the
 //                                          role ids (comma-separated) allowed to ask for one
 // Run with: npm start
@@ -19,7 +20,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Anthropic from "@anthropic-ai/sdk";
-import { ChannelType, Client, Events, GatewayIntentBits, OverwriteType, PermissionFlagsBits } from "discord.js";
+import { ChannelType, Client, Events, GatewayIntentBits, OverwriteType, Partials, PermissionFlagsBits } from "discord.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 for (const file of [path.join(here, ".env"), path.join(here, "..", "connector", ".env")]) {
@@ -62,6 +63,11 @@ const ROOM_TOOL = {
 };
 const ROOMS_ON = `\n- If someone asks you to make, open or start a voice chat, room, vc or lobby for a game, call create_game_room instead of replying.`;
 const ROOMS_OFF = `\n- If someone asks you to make a game room or voice chat, tell them only members can do that.`;
+// Game tags: every post in the games forum gets a ping role; reacting with TAG_EMOJI on the post's
+// first message gives you the role, removing the reaction takes it away.
+const GAMES_FORUM_ID = process.env.GAMES_FORUM_ID || "";
+const TAG_EMOJI = "🔔";
+const TAGS_FILE = path.join(here, "tags.json"); // forum post id -> { roleId, noted }
 const MAX_TOKENS = 2000;
 const HISTORY_MESSAGES = 10;    // recent channel messages sent as context
 const USER_COOLDOWN_MS = 15_000; // per person, between questions
@@ -97,7 +103,9 @@ How to reply:
 // The placeholder only stops the constructor throwing; without a real key the bot never logs in (see the bottom).
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || "missing" });
 const discord = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessageReactions],
+  // Partials let reactions on older (uncached) forum posts still come through.
+  partials: [Partials.Message, Partials.Reaction, Partials.User, Partials.Channel],
   allowedMentions: { parse: [], repliedUser: true }, // the bot can never mass-ping
 });
 
@@ -117,12 +125,84 @@ discord.once(Events.ClientReady, (c) => {
   writeStatus();
   console.log(`Logged in as ${c.user.tag}. Model ${MODEL}, ask channel ${ASK_CHANNEL_ID || "none (mentions only)"}.`);
   if (ROOMS_CATEGORY_ID) setInterval(cleanUpRooms, 60_000);
+  if (GAMES_FORUM_ID) setupAllGameTags().catch((e) => console.error("Game tag setup failed:", e.message));
   if (PATCH_FEEDS.length) {
     console.log(`Patch notes for: ${PATCH_FEEDS.map((f) => f.name).join(", ")} (checking every ${PATCH_CHECK_MS / 60_000} min)`);
     setTimeout(checkPatchNotes, 30_000);
     setInterval(checkPatchNotes, PATCH_CHECK_MS);
   }
 });
+
+// ---- Game tags --------------------------------------------------------------
+function loadTags() {
+  try { return JSON.parse(fs.readFileSync(TAGS_FILE, "utf8")); } catch { return {}; }
+}
+function saveTags(tags) {
+  try { fs.writeFileSync(TAGS_FILE, JSON.stringify(tags, null, 2)); } catch (e) { console.error("Couldn't save tags:", e.message); }
+}
+// "🦸 Apex Legends" -> "Apex Legends"
+const gameNameFromPost = (name) => name.replace(/^[^\p{L}\p{N}]+/u, "").trim();
+
+async function setupAllGameTags() {
+  const forum = await discord.channels.fetch(GAMES_FORUM_ID);
+  const active = await forum.threads.fetchActive();
+  const archived = await forum.threads.fetchArchived({ limit: 100 });
+  for (const thread of [...active.threads.values(), ...archived.threads.values()]) {
+    if (thread.parentId === GAMES_FORUM_ID) await setupGameTag(thread).catch((e) => console.error(`Tag setup for ${thread.name}:`, e.message));
+  }
+}
+
+// Makes sure a forum post has a ping role, a bell reaction on its first message, and a note saying how it works.
+async function setupGameTag(thread) {
+  const tags = loadTags();
+  const game = gameNameFromPost(thread.name);
+  if (!game) return;
+  const guild = thread.guild;
+  let role = tags[thread.id] && guild.roles.cache.get(tags[thread.id].roleId);
+  if (!role) {
+    const lower = game.toLowerCase();
+    role = guild.roles.cache.find((r) => !r.managed && r.mentionable && r.permissions.bitfield === 0n &&
+      (r.name.toLowerCase() === lower || lower.startsWith(r.name.toLowerCase() + " ")));
+    role ??= await guild.roles.create({ name: game.slice(0, 100), mentionable: true, permissions: [], reason: `Game tag for the ${game} post` });
+    tags[thread.id] = { roleId: role.id, noted: false };
+    saveTags(tags);
+    console.log(`[tags] ${thread.name} -> @${role.name}`);
+  }
+
+  const starter = await thread.fetchStarterMessage().catch(() => null);
+  if (!starter) return;
+  if (!starter.reactions.cache.get(TAG_EMOJI)?.me) await starter.react(TAG_EMOJI);
+  if (!tags[thread.id].noted) {
+    const note = `-# React ${TAG_EMOJI} on this post to get the @${role.name} tag, so you get pinged when people want to play. Remove it to stop.`;
+    if (starter.author.id === discord.user.id) {
+      if (!starter.content.includes(TAG_EMOJI)) await starter.edit({ content: `${starter.content}\n${note}`.slice(0, 2000), allowedMentions: { parse: [] } });
+    } else {
+      await thread.send({ content: note, allowedMentions: { parse: [] } });
+    }
+    tags[thread.id].noted = true;
+    saveTags(tags);
+  }
+}
+
+async function onTagReaction(reaction, user, add) {
+  if (user.bot) return;
+  if (reaction.partial) await reaction.fetch().catch(() => null);
+  if (reaction.emoji.name !== TAG_EMOJI) return;
+  const entry = loadTags()[reaction.message.channelId];
+  if (!entry || reaction.message.id !== reaction.message.channelId) return; // only the post's first message
+  const member = await reaction.message.guild.members.fetch(user.id).catch(() => null);
+  if (!member) return;
+  if (add) await member.roles.add(entry.roleId, "Picked up a game tag").catch((e) => console.error("Tag add failed:", e.message));
+  else await member.roles.remove(entry.roleId, "Dropped a game tag").catch((e) => console.error("Tag remove failed:", e.message));
+}
+
+discord.on(Events.ThreadCreate, async (thread, newlyCreated) => {
+  if (!newlyCreated || thread.parentId !== GAMES_FORUM_ID || !GAMES_FORUM_ID) return;
+  await new Promise((r) => setTimeout(r, 3000)); // give Discord a moment to attach the first message
+  await setupGameTag(thread).catch((e) => console.error(`Tag setup for ${thread.name}:`, e.message));
+});
+discord.on(Events.MessageReactionAdd, (reaction, user) => onTagReaction(reaction, user, true));
+discord.on(Events.MessageReactionRemove, (reaction, user) => onTagReaction(reaction, user, false));
 
 // ---- Game rooms -------------------------------------------------------------
 function isMember(member) {
