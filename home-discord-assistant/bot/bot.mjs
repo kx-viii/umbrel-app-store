@@ -11,13 +11,15 @@
 //   PATCH_FEEDS                            Steam games to post patch notes for, as steamAppId:forumPostId:Name,
 //                                          separated by ";" (e.g. 1172470:123456789:Apex Legends)
 //   GAMES_CHAT_ID                          channel that gets a short "new patch notes" heads-up
+//   ROOMS_CATEGORY_ID, MEMBER_ROLE_IDS     game rooms: the category temporary voice rooms go in, and the
+//                                          role ids (comma-separated) allowed to ask for one
 // Run with: npm start
 
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Anthropic from "@anthropic-ai/sdk";
-import { Client, Events, GatewayIntentBits } from "discord.js";
+import { ChannelType, Client, Events, GatewayIntentBits, OverwriteType, PermissionFlagsBits } from "discord.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 for (const file of [path.join(here, ".env"), path.join(here, "..", "connector", ".env")]) {
@@ -38,6 +40,28 @@ const PATCH_FEEDS = (process.env.PATCH_FEEDS || "").split(";").map((s) => s.trim
 const GAMES_CHAT_ID = process.env.GAMES_CHAT_ID || "";
 const PATCH_CHECK_MS = 30 * 60_000;                      // how often to check Steam for new posts
 const PATCH_STATE_FILE = path.join(here, "patch-state.json"); // last Steam post handled per game
+// Game rooms: members can ask for a temporary voice channel for a game; it's deleted once empty for a while.
+const ROOMS_CATEGORY_ID = process.env.ROOMS_CATEGORY_ID || "";                // category the rooms go in
+const MEMBER_ROLE_IDS = (process.env.MEMBER_ROLE_IDS || "").split(",").map((s) => s.trim()).filter(Boolean); // who may make rooms
+const ROOM_EMPTY_MS = 10 * 60_000;  // delete a room after it's been empty this long
+const MAX_ROOMS = 4;                // at most this many rooms at once
+const ROOMS_FILE = path.join(here, "rooms.json");
+const ROOM_TOOL = {
+  name: "create_game_room",
+  description: "Open a temporary voice channel for a game, when someone asks to make, open or start a chat, room, vc or lobby for a game. It's deleted automatically once it's been empty for 10 minutes.",
+  input_schema: {
+    type: "object",
+    properties: {
+      game: { type: "string", description: "The game's name, properly capitalised, e.g. Overwatch, Minecraft, Apex Legends" },
+      public: { type: "boolean", description: "true only if they ask for it to be public or open to everyone; otherwise members only" },
+    },
+    required: ["game", "public"],
+    additionalProperties: false,
+  },
+  strict: true,
+};
+const ROOMS_ON = `\n- If someone asks you to make, open or start a voice chat, room, vc or lobby for a game, call create_game_room instead of replying.`;
+const ROOMS_OFF = `\n- If someone asks you to make a game room or voice chat, tell them only members can do that.`;
 const MAX_TOKENS = 2000;
 const HISTORY_MESSAGES = 10;    // recent channel messages sent as context
 const USER_COOLDOWN_MS = 15_000; // per person, between questions
@@ -73,7 +97,7 @@ How to reply:
 // The placeholder only stops the constructor throwing; without a real key the bot never logs in (see the bottom).
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || "missing" });
 const discord = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates],
   allowedMentions: { parse: [], repliedUser: true }, // the bot can never mass-ping
 });
 
@@ -92,12 +116,73 @@ discord.once(Events.ClientReady, (c) => {
   state = `Online as ${c.user.tag}`;
   writeStatus();
   console.log(`Logged in as ${c.user.tag}. Model ${MODEL}, ask channel ${ASK_CHANNEL_ID || "none (mentions only)"}.`);
+  if (ROOMS_CATEGORY_ID) setInterval(cleanUpRooms, 60_000);
   if (PATCH_FEEDS.length) {
     console.log(`Patch notes for: ${PATCH_FEEDS.map((f) => f.name).join(", ")} (checking every ${PATCH_CHECK_MS / 60_000} min)`);
     setTimeout(checkPatchNotes, 30_000);
     setInterval(checkPatchNotes, PATCH_CHECK_MS);
   }
 });
+
+// ---- Game rooms -------------------------------------------------------------
+function isMember(member) {
+  return Boolean(member) && MEMBER_ROLE_IDS.some((id) => member.roles.cache.has(id));
+}
+
+function loadRooms() {
+  try { return JSON.parse(fs.readFileSync(ROOMS_FILE, "utf8")); } catch { return {}; }
+}
+function saveRooms(rooms) {
+  try { fs.writeFileSync(ROOMS_FILE, JSON.stringify(rooms, null, 2)); } catch (e) { console.error("Couldn't save rooms:", e.message); }
+}
+
+async function createGameRoom(message, { game, public: isPublic }) {
+  const name = `🎮 ${String(game).replace(/[^\p{L}\p{N} :'&+-]/gu, "").trim().slice(0, 40) || "Game"}`;
+  const rooms = loadRooms();
+  const existing = message.guild.channels.cache.find((c) => rooms[c.id] && c.name.toLowerCase() === name.toLowerCase());
+  if (existing) return message.reply(`There's already a room for that: ${existing}`);
+  if (Object.keys(rooms).length >= MAX_ROOMS) return message.reply(`There are already ${MAX_ROOMS} game rooms open. Use one of those or wait for one to close.`);
+
+  const category = await message.guild.channels.fetch(ROOMS_CATEGORY_ID);
+  const view = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.Connect;
+  // Members-only rooms copy the category's access; public rooms let everyone see and join.
+  const self = { id: discord.user.id, type: OverwriteType.Member, allow: view | PermissionFlagsBits.ManageChannels };
+  const overwrites = isPublic
+    ? [{ id: message.guild.roles.everyone.id, type: OverwriteType.Role, allow: view }, self]
+    : [...category.permissionOverwrites.cache.values()].map((o) => ({ id: o.id, allow: o.allow, deny: o.deny, type: o.type })).concat(self);
+  const room = await message.guild.channels.create({
+    name, type: ChannelType.GuildVoice, parent: ROOMS_CATEGORY_ID, permissionOverwrites: overwrites,
+    reason: `Game room requested by ${message.author.tag}`,
+  });
+  rooms[room.id] = { name, createdAt: Date.now(), lastActive: Date.now(), by: message.author.id };
+  saveRooms(rooms);
+
+  // Ping the matching game tag, if there is one.
+  const gameName = name.slice(2).toLowerCase();
+  const tag = message.guild.roles.cache.find((r) => r.mentionable && !r.managed && (r.name.toLowerCase() === gameName || gameName.startsWith(r.name.toLowerCase() + " ")));
+  await message.reply({
+    content: `🔊 ${isPublic ? "Public room" : "Room"} for **${name.slice(2)}** is open: ${room}${tag ? ` ${tag}` : ""}\n-# It closes after 10 minutes empty.`,
+    allowedMentions: { roles: tag ? [tag.id] : [], repliedUser: true },
+  });
+  console.log(`[rooms] ${message.author.tag} opened ${name} (${isPublic ? "public" : "members"})`);
+}
+
+async function cleanUpRooms() {
+  const rooms = loadRooms();
+  let changed = false;
+  for (const [id, info] of Object.entries(rooms)) {
+    const channel = await discord.channels.fetch(id).catch(() => null);
+    if (!channel) { delete rooms[id]; changed = true; continue; }
+    if (channel.members.size > 0) { info.lastActive = Date.now(); changed = true; continue; }
+    if (Date.now() - info.lastActive > ROOM_EMPTY_MS) {
+      await channel.delete("Game room empty for 10 minutes").catch((e) => console.error("Couldn't delete room:", e.message));
+      delete rooms[id];
+      changed = true;
+      console.log(`[rooms] closed ${info.name}`);
+    }
+  }
+  if (changed) saveRooms(rooms);
+}
 
 // ---- Patch notes ------------------------------------------------------------
 // Checks each game's Steam announcements. New ones that contain actual game changes get a short
@@ -211,12 +296,14 @@ discord.on(Events.MessageCreate, async (message) => {
     const context = await recentHistory(message);
     const personResearched = researchByPerson.get(message.author.id) ?? 0;
     const canSearch = searchSpentToday < SEARCH_BUDGET_USD && personResearched < RESEARCH_PER_PERSON;
+    const canMakeRooms = Boolean(ROOMS_CATEGORY_ID) && isMember(message.member);
+    const tools = [...(canSearch ? RESEARCH_TOOLS : []), ...(canMakeRooms ? [ROOM_TOOL] : [])];
     const response = await anthropic.messages.create({
       model: MODEL,
       max_tokens: MAX_TOKENS,
       output_config: { effort: "medium" },
-      ...(canSearch && { tools: RESEARCH_TOOLS }),
-      system: systemPrompt(discord.user.username, message.guild.name, canSearch),
+      ...(tools.length && { tools }),
+      system: systemPrompt(discord.user.username, message.guild.name, canSearch) + (ROOMS_CATEGORY_ID ? (canMakeRooms ? ROOMS_ON : ROOMS_OFF) : ""),
       messages: [{
         role: "user",
         content:
@@ -241,6 +328,9 @@ discord.on(Events.MessageCreate, async (message) => {
     if (response.stop_reason === "refusal") {
       return message.reply("Sorry, I can't help with that one.");
     }
+    // A game room request: make the room and announce it ourselves; no second Claude call needed.
+    const roomCall = response.content.find((b) => b.type === "tool_use" && b.name === ROOM_TOOL.name);
+    if (roomCall) return createGameRoom(message, roomCall.input);
     const textBlocks = response.content.filter((b) => b.type === "text");
     let text = textBlocks.map((b) => b.text).join("").trim();
     if (!text) text = "I didn't come up with an answer for that. Try rephrasing?";
