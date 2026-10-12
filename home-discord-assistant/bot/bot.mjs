@@ -1,0 +1,217 @@
+// A Discord bot that answers questions using Claude.
+// Replies to every message in the ask channel (if set), and to @mentions anywhere else.
+//
+// Everything comes from environment variables, read from ./.env (and ../connector/.env) if present:
+//   ANTHROPIC_API_KEY, DISCORD_BOT_TOKEN   required
+//   ASK_CHANNEL_ID                         channel it answers everything in (otherwise @mentions only)
+//   SERVER_INFO                            a few sentences about the server, added to Claude's instructions
+//   OWNER_NAME                             who people should tell when something's wrong
+//   MODEL, STATUS_FILE                     optional; STATUS_FILE gets a small HTML status page
+// Run with: npm start
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import Anthropic from "@anthropic-ai/sdk";
+import { Client, Events, GatewayIntentBits } from "discord.js";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+for (const file of [path.join(here, ".env"), path.join(here, "..", "connector", ".env")]) {
+  if (fs.existsSync(file)) process.loadEnvFile(file);
+}
+
+// ---- Settings ---------------------------------------------------------------
+const MODEL = process.env.MODEL || "claude-haiku-5-5";
+const ASK_CHANNEL_ID = process.env.ASK_CHANNEL_ID || "";
+const SERVER_INFO = process.env.SERVER_INFO || "";
+const OWNER_NAME = process.env.OWNER_NAME || "the server owner";
+const STATUS_FILE = process.env.STATUS_FILE;
+const MAX_TOKENS = 1024;
+const HISTORY_MESSAGES = 10;    // recent channel messages sent as context
+const USER_COOLDOWN_MS = 15_000; // per person, between questions
+const DAILY_LIMIT = 200;         // questions per day across the whole server
+// Haiku 5.5 prices, USD per token (only used for the running cost estimate in the log).
+const PRICE_IN = 0.10 / 1e6;
+const PRICE_OUT = 0.50 / 1e6;
+
+function systemPrompt(botName, serverName) {
+  return `You are ${botName}, the assistant in the Discord server "${serverName}".
+${SERVER_INFO ? `\nAbout this server: ${SERVER_INFO}\n` : ""}
+How to reply:
+- This is Discord chat: keep it short and casual, usually a few sentences. Use Discord markdown sparingly (bold, lists, code blocks for commands or configs).
+- Never try to ping @everyone, @here or roles.
+- You'll be shown recent messages from the channel for context. Answer the latest question; use the earlier messages only to understand it.
+- You don't know the server's private details (IPs, passwords, whitelists, mod lists) unless they appear in the messages you're shown. Don't make them up; say who to ask instead.
+- If you're unsure or the answer may be out of date (game patches change fast), say so.`;
+}
+
+// ---- Clients ----------------------------------------------------------------
+// The placeholder only stops the constructor throwing; without a real key the bot never logs in (see the bottom).
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || "missing" });
+const discord = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  allowedMentions: { parse: [], repliedUser: true }, // the bot can never mass-ping
+});
+
+const lastAsked = new Map(); // userId -> timestamp
+let day = new Date().toDateString();
+let askedToday = 0;
+let spentUsd = 0;
+let state = "Starting";
+let lastError = "";
+const startedAt = new Date();
+
+discord.once(Events.ClientReady, (c) => {
+  state = `Online as ${c.user.tag}`;
+  writeStatus();
+  console.log(`Logged in as ${c.user.tag}. Model ${MODEL}, ask channel ${ASK_CHANNEL_ID || "none (mentions only)"}.`);
+});
+
+discord.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot || !message.inGuild()) return;
+
+  const inAskChannel = Boolean(ASK_CHANNEL_ID) && message.channelId === ASK_CHANNEL_ID;
+  const mentioned = message.mentions.users.has(discord.user.id);
+  if (!inAskChannel && !mentioned) return;
+
+  // Daily cap, reset at midnight.
+  const today = new Date().toDateString();
+  if (today !== day) { day = today; askedToday = 0; }
+  if (askedToday >= DAILY_LIMIT) {
+    return message.reply("I've hit my question limit for today. Try again tomorrow!");
+  }
+
+  // Per-person cooldown.
+  const now = Date.now();
+  const waitMs = (lastAsked.get(message.author.id) ?? 0) + USER_COOLDOWN_MS - now;
+  if (waitMs > 0) {
+    return message.reply(`Give me ${Math.ceil(waitMs / 1000)}s before your next question.`);
+  }
+  lastAsked.set(message.author.id, now);
+  askedToday++;
+
+  const question = cleanContent(message) || "(they just said hi or pinged you)";
+  await message.channel.sendTyping().catch(() => {});
+
+  try {
+    const context = await recentHistory(message);
+    const response = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: MAX_TOKENS,
+      output_config: { effort: "low" },
+      system: systemPrompt(discord.user.username, message.guild.name),
+      messages: [{
+        role: "user",
+        content:
+          `Today is ${new Date().toDateString()}. Channel: #${message.channel.name}.\n\n` +
+          (context ? `Recent messages (oldest first):\n${context}\n\n` : "") +
+          `Latest message, from ${displayName(message)}:\n${question}`,
+      }],
+    });
+
+    const cost = response.usage.input_tokens * PRICE_IN + response.usage.output_tokens * PRICE_OUT;
+    spentUsd += cost;
+    console.log(`[${new Date().toLocaleTimeString()}] ${message.author.tag}: ${response.usage.input_tokens} in / ${response.usage.output_tokens} out, ~$${cost.toFixed(5)} (session ~$${spentUsd.toFixed(4)}, ${askedToday} today)`);
+    writeStatus();
+
+    if (response.stop_reason === "refusal") {
+      return message.reply("Sorry, I can't help with that one.");
+    }
+    let text = response.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+    if (!text) text = "I didn't come up with an answer for that. Try rephrasing?";
+    if (response.stop_reason === "max_tokens") text += " …";
+    await sendReply(message, text);
+  } catch (error) {
+    console.error("Claude request failed:", error?.status, error?.type ?? "", error?.message);
+    lastError = `${new Date().toLocaleString("en-GB")}: ${friendlyError(error)}`;
+    writeStatus();
+    await message.reply(friendlyError(error)).catch(() => {});
+  }
+});
+
+// ---- Helpers ----------------------------------------------------------------
+function displayName(message) {
+  return message.member?.displayName ?? message.author.globalName ?? message.author.username;
+}
+
+// Message text with the bot's own @mention removed and other mentions shown as names.
+function cleanContent(message) {
+  const names = new Set([discord.user.username, message.guild.members.me?.displayName].filter(Boolean));
+  let text = message.cleanContent;
+  for (const name of names) text = text.split(`@${name}`).join("");
+  return text.trim();
+}
+
+async function recentHistory(message) {
+  const fetched = await message.channel.messages.fetch({ limit: HISTORY_MESSAGES, before: message.id }).catch(() => null);
+  if (!fetched) return "";
+  return [...fetched.values()]
+    .reverse()
+    .filter((m) => m.cleanContent.trim())
+    .map((m) => `${m.author.id === discord.user.id ? `${discord.user.username} (you)` : displayName(m)}: ${m.cleanContent.slice(0, 500)}`)
+    .join("\n");
+}
+
+// Discord messages max out at 2000 characters.
+async function sendReply(message, text) {
+  const chunks = text.match(/[\s\S]{1,1900}(?=\s|$)|[\s\S]{1,1900}/g) ?? [text];
+  await message.reply(chunks[0]);
+  for (const chunk of chunks.slice(1)) await message.channel.send(chunk);
+}
+
+function friendlyError(error) {
+  if (error instanceof Anthropic.AuthenticationError) return `My API key isn't working. Someone tell ${OWNER_NAME}!`;
+  if (error instanceof Anthropic.RateLimitError) return "I'm getting too many questions right now. Try again in a minute.";
+  if (error instanceof Anthropic.APIError) {
+    // Out of credit shows up as a billing error (or, on older responses, a 400 mentioning the credit balance).
+    if (error.type === "billing_error" || /credit balance/i.test(error.message ?? "")) {
+      return `I'm out of credit for now, so I can't answer until ${OWNER_NAME} tops me up.`;
+    }
+    if (error.type === "overloaded_error" || (error.status ?? 0) >= 500) return "Claude's servers are busy. Try again in a minute.";
+  }
+  return "Something went wrong answering that. Try again in a bit.";
+}
+
+// A tiny HTML page with the bot's state, for the Umbrel app's window. Never includes keys.
+function writeStatus() {
+  if (!STATUS_FILE) return;
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const row = (label, value) => `<tr><th>${label}</th><td>${esc(value)}</td></tr>`;
+  const title = esc(discord.user?.username ?? "Discord bot");
+  const html = `<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=30><title>${title}</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10131c;color:#e8ecf4;font:16px/1.5 system-ui,sans-serif}main{max-width:30rem;padding:2rem 1rem}h1{margin:0 0 1rem;font-size:1.4rem}table{border-collapse:collapse;width:100%}th{text-align:left;color:#8a93a8;font-weight:500;padding:.35rem 1rem .35rem 0;white-space:nowrap;vertical-align:top}td{padding:.35rem 0}.note{color:#8a93a8;font-size:.9rem}code{background:#1c2130;padding:.1rem .3rem;border-radius:.25rem}</style>
+</head><body><main><h1>${title}</h1><table>
+${row("Status", state)}
+${row("Model", MODEL)}
+${row("Questions today", `${askedToday} of ${DAILY_LIMIT}`)}
+${row("Spent since restart", `~$${spentUsd.toFixed(4)}`)}
+${row("Running since", startedAt.toLocaleString("en-GB"))}
+${lastError ? row("Last error", lastError) : ""}
+</table>
+<p class=note>Keys are set in Umbrel: right-click the app &gt; Settings &gt; Advanced &gt; Custom variables, service <code>bot</code>: <code>ANTHROPIC_API_KEY</code> and <code>DISCORD_BOT_TOKEN</code>. Restart the app after changing them.</p>
+</main></body></html>`;
+  try {
+    fs.writeFileSync(STATUS_FILE + ".tmp", html);
+    fs.renameSync(STATUS_FILE + ".tmp", STATUS_FILE);
+  } catch (e) {
+    console.error("Couldn't write status page:", e.message);
+  }
+}
+
+const missing = ["ANTHROPIC_API_KEY", "DISCORD_BOT_TOKEN"].filter((name) => !process.env[name]);
+if (missing.length) {
+  // Stay up (instead of crash-looping) so the status page can say what's needed.
+  state = `Waiting for keys: ${missing.join(" and ")} not set`;
+  console.error(state);
+  writeStatus();
+  setInterval(() => {}, 1 << 30);
+} else {
+  writeStatus();
+  discord.login(process.env.DISCORD_BOT_TOKEN).catch((error) => {
+    state = "Couldn't log in to Discord (check DISCORD_BOT_TOKEN)";
+    lastError = error.message;
+    console.error(state, error.message);
+    writeStatus();
+    setTimeout(() => process.exit(1), 60_000); // let Umbrel restart it, but not in a tight loop
+  });
+}
