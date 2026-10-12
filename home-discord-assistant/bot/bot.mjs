@@ -788,10 +788,14 @@ async function checkStreams() {
       const s = streams[channel] ?? { live: false, offlineSince: 0 };
       if (live && !s.live) {
         s.live = true;
-        if (Date.now() - (s.offlineSince || 0) >= STREAM_REANNOUNCE_MS) await announceLive(channel);
+        if (Date.now() - (s.offlineSince || 0) >= STREAM_REANNOUNCE_MS) s.alert = await announceLive(channel);
       } else if (!live && s.live) {
         s.live = false;
         s.offlineSince = Date.now();
+      } else if (!live && s.alert && Date.now() - s.offlineSince >= STREAM_REANNOUNCE_MS) {
+        // Offline long enough that coming back counts as a new stream, so the old notice goes.
+        await removeLiveAlert(channel, s.alert);
+        delete s.alert;
       }
       streams[channel] = s;
     } catch (error) {
@@ -808,11 +812,25 @@ async function announceLive(channel) {
   const target = post ?? (GAMES_CHAT_ID ? await discord.channels.fetch(GAMES_CHAT_ID) : null);
   if (!target) return;
   const playing = game && !post ? ` playing **${game}**` : "";
-  await target.send({
+  const msg = await target.send({
     content: `🔴 **${channel}** is live${playing}: *${title.replace(/[*_~`|]/g, "").slice(0, 200)}*\nhttps://twitch.tv/${channel}`,
     allowedMentions: { parse: [] },
   });
   console.log(`[live] ${channel} is live (${game || "no game"}) -> ${post ? post.name : "games chat"}`);
+  return { channelId: msg.channelId, messageId: msg.id };
+}
+
+async function removeLiveAlert(channel, alert) {
+  try {
+    const where = await discord.channels.fetch(alert.channelId);
+    // Messages in an auto-archived forum post can't be deleted until it's reopened.
+    if (where.isThread() && where.archived) await where.setArchived(false, "Removing an ended live alert");
+    await where.messages.delete(alert.messageId);
+    console.log(`[live] ${channel} went offline, removed the alert`);
+  } catch (error) {
+    // 10003/10008: the post or message is already gone.
+    if (![10003, 10008].includes(error.code)) console.error(`Couldn't remove live alert for ${channel}:`, error.message);
+  }
 }
 
 // ---- Patch notes ------------------------------------------------------------
