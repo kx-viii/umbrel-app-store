@@ -30,11 +30,17 @@ const MAX_TOKENS = 1024;
 const HISTORY_MESSAGES = 10;    // recent channel messages sent as context
 const USER_COOLDOWN_MS = 15_000; // per person, between questions
 const DAILY_LIMIT = 200;         // questions per day across the whole server
-// Haiku 5.5 prices, USD per token (only used for the running cost estimate in the log).
+const SEARCHES_PER_DAY = 10;     // web searches per day across the whole server
+const SEARCHES_PER_PERSON = 3;   // web searches per person per day
+// Haiku 5.5 prices in USD (only used for the running cost estimate in the log).
 const PRICE_IN = 0.10 / 1e6;
 const PRICE_OUT = 0.50 / 1e6;
+const PRICE_SEARCH = 0.01;
 
-function systemPrompt(botName, serverName) {
+const SEARCH_ON = `\n- You can search the web once per question. Only search when the answer depends on recent or changing information (patch notes, release dates, news, prices, events) and you aren't confident without it. Otherwise answer from what you know.`;
+const SEARCH_OFF = `\n- Web search isn't available right now (today's search limit is used up). If the question needs current information, answer from what you know and say you couldn't check online today.`;
+
+function systemPrompt(botName, serverName, canSearch) {
   return `You are ${botName}, the assistant in the Discord server "${serverName}".
 ${SERVER_INFO ? `\nAbout this server: ${SERVER_INFO}\n` : ""}
 How to reply:
@@ -42,7 +48,7 @@ How to reply:
 - Never try to ping @everyone, @here or roles.
 - You'll be shown recent messages from the channel for context. Answer the latest question; use the earlier messages only to understand it.
 - You don't know the server's private details (IPs, passwords, whitelists, mod lists) unless they appear in the messages you're shown. Don't make them up; say who to ask instead.
-- If you're unsure or the answer may be out of date (game patches change fast), say so.`;
+- If you're unsure or the answer may be out of date (game patches change fast), say so.${canSearch ? SEARCH_ON : SEARCH_OFF}`;
 }
 
 // ---- Clients ----------------------------------------------------------------
@@ -56,6 +62,8 @@ const discord = new Client({
 const lastAsked = new Map(); // userId -> timestamp
 let day = new Date().toDateString();
 let askedToday = 0;
+let searchesToday = 0;
+const searchesByPerson = new Map(); // userId -> searches today
 let spentUsd = 0;
 let state = "Starting";
 let lastError = "";
@@ -76,7 +84,7 @@ discord.on(Events.MessageCreate, async (message) => {
 
   // Daily cap, reset at midnight.
   const today = new Date().toDateString();
-  if (today !== day) { day = today; askedToday = 0; }
+  if (today !== day) { day = today; askedToday = 0; searchesToday = 0; searchesByPerson.clear(); }
   if (askedToday >= DAILY_LIMIT) {
     return message.reply("I've hit my question limit for today. Try again tomorrow!");
   }
@@ -95,11 +103,15 @@ discord.on(Events.MessageCreate, async (message) => {
 
   try {
     const context = await recentHistory(message);
+    const personSearches = searchesByPerson.get(message.author.id) ?? 0;
+    const canSearch = searchesToday < SEARCHES_PER_DAY && personSearches < SEARCHES_PER_PERSON;
     const response = await anthropic.messages.create({
       model: MODEL,
       max_tokens: MAX_TOKENS,
       output_config: { effort: "low" },
-      system: systemPrompt(discord.user.username, message.guild.name),
+      // The basic search tool: the dynamic-filtering version doesn't run on Haiku 5.5.
+      ...(canSearch && { tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 1 }] }),
+      system: systemPrompt(discord.user.username, message.guild.name, canSearch),
       messages: [{
         role: "user",
         content:
@@ -109,17 +121,24 @@ discord.on(Events.MessageCreate, async (message) => {
       }],
     });
 
-    const cost = response.usage.input_tokens * PRICE_IN + response.usage.output_tokens * PRICE_OUT;
+    const searches = response.usage.server_tool_use?.web_search_requests ?? 0;
+    searchesToday += searches;
+    if (searches) searchesByPerson.set(message.author.id, personSearches + searches);
+    const cost = response.usage.input_tokens * PRICE_IN + response.usage.output_tokens * PRICE_OUT + searches * PRICE_SEARCH;
     spentUsd += cost;
-    console.log(`[${new Date().toLocaleTimeString()}] ${message.author.tag}: ${response.usage.input_tokens} in / ${response.usage.output_tokens} out, ~$${cost.toFixed(5)} (session ~$${spentUsd.toFixed(4)}, ${askedToday} today)`);
+    console.log(`[${new Date().toLocaleTimeString()}] ${message.author.tag}: ${response.usage.input_tokens} in / ${response.usage.output_tokens} out, ${searches} search, ~$${cost.toFixed(5)} (session ~$${spentUsd.toFixed(4)}, ${askedToday} questions / ${searchesToday} searches today)`);
     writeStatus();
 
     if (response.stop_reason === "refusal") {
       return message.reply("Sorry, I can't help with that one.");
     }
-    let text = response.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+    const textBlocks = response.content.filter((b) => b.type === "text");
+    let text = textBlocks.map((b) => b.text).join("").trim();
     if (!text) text = "I didn't come up with an answer for that. Try rephrasing?";
     if (response.stop_reason === "max_tokens") text += " …";
+    // Up to two sources from search citations, in small text, with <> so Discord doesn't embed them.
+    const sources = [...new Set(textBlocks.flatMap((b) => (b.citations ?? []).map((c) => c.url)).filter(Boolean))].slice(0, 2);
+    if (sources.length) text += `\n-# Sources: ${sources.map((url) => `<${url}>`).join(" ")}`;
     await sendReply(message, text);
   } catch (error) {
     console.error("Claude request failed:", error?.status, error?.type ?? "", error?.message);
@@ -184,6 +203,7 @@ function writeStatus() {
 ${row("Status", state)}
 ${row("Model", MODEL)}
 ${row("Questions today", `${askedToday} of ${DAILY_LIMIT}`)}
+${row("Web searches today", `${searchesToday} of ${SEARCHES_PER_DAY} (max ${SEARCHES_PER_PERSON} per person)`)}
 ${row("Spent since restart", `~$${spentUsd.toFixed(4)}`)}
 ${row("Running since", startedAt.toLocaleString("en-GB"))}
 ${lastError ? row("Last error", lastError) : ""}
