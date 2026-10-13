@@ -1119,7 +1119,7 @@ Press **Make a request** or use \`/request\`.
 
 - Check the match and press **That's it**.
 - Once it's approved, it gets a post in <#${MEDIA_FORUM_ID}> and you're pinged there. When it's ready, the watch link is posted there too. Links last ${MEDIA_LINK_HOURS} hours.
-- ${MEDIA_PER_WEEK} requests a week each. If someone has already asked for it, you're added to theirs instead, and it doesn't use one of yours.`;
+- If someone has already asked for it, you're added to theirs instead.`;
 
 function loadMedia() {
   try { return JSON.parse(fs.readFileSync(MEDIA_FILE, "utf8")); } catch { return { requests: {} }; }
