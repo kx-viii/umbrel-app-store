@@ -240,6 +240,21 @@ const api = async (path, opts = {}) => {
 };
 const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
 const results = document.getElementById("results");
+// navigator.clipboard only works on https pages, and the Umbrel dashboard is usually plain http, so fall back to execCommand
+async function copyText(text, btn) {
+  let ok = false;
+  try { if (window.isSecureContext && navigator.clipboard) { await navigator.clipboard.writeText(text); ok = true; } } catch {}
+  if (!ok) {
+    const t = el("textarea", { value: text });
+    t.style.cssText = "position:fixed;top:0;left:0;opacity:0";
+    document.body.append(t);
+    t.focus(); t.select(); t.setSelectionRange(0, text.length);
+    try { ok = document.execCommand("copy"); } catch {}
+    t.remove();
+  }
+  if (btn) { const old = btn.textContent; btn.textContent = ok ? "Copied" : "Press and hold the link to copy"; setTimeout(() => (btn.textContent = old), 2000); }
+  return ok;
+}
 const when = (t) => new Date(t).toLocaleString(undefined, { weekday:"short", day:"numeric", month:"short", hour:"numeric", minute:"2-digit" });
 
 async function share(body) {
@@ -289,13 +304,14 @@ async function loadShares() {
       + " · " + s.views + " view" + (s.views === 1 ? "" : "s") + (s.createdBy ? " · by " + s.createdBy : "");
     const r = row(s.title, info);
     if (live) r.append(
-      button("Copy", () => navigator.clipboard.writeText(s.url)),
+      button("Copy", (e) => copyText(s.url, e.currentTarget)),
       button("Turn off", async () => { if (confirm("Turn off this link?")) { await api("shares/" + s.token, { method: "DELETE" }); loadShares(); } }),
     );
     return r;
   }));
 }
-document.getElementById("copy").addEventListener("click", () => navigator.clipboard.writeText(document.getElementById("linkText").value));
+document.getElementById("copy").addEventListener("click", (e) => copyText(document.getElementById("linkText").value, e.currentTarget));
+document.getElementById("linkText").addEventListener("focus", (e) => e.target.select());
 loadShares();
 </script>
 </body></html>`;
