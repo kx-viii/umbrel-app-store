@@ -334,6 +334,26 @@ async function handleAdmin(req, res) {
     const d = await jellyfinJson(`/Items?searchTerm=${encodeURIComponent(q)}&IncludeItemTypes=Movie,Series&Recursive=true&Limit=20&Fields=ProductionYear`);
     return json(res, 200, d.Items.map((i) => ({ id: i.Id, name: i.Name, year: i.ProductionYear, type: i.Type })));
   }
+  // GET /api/find?tmdb=<id>|tvdb=<id>&type=movie|tv   is it in Jellyfin yet? Searches every library, including ones
+  // no user can see, so other apps can tell when a download has landed. For shows, also counts episodes per season.
+  if (req.method === "GET" && p === "/api/find") {
+    const type = url.searchParams.get("type") === "tv" ? "Series" : "Movie";
+    const tmdb = url.searchParams.get("tmdb") || "", tvdb = url.searchParams.get("tvdb") || "";
+    if (!/^\d{1,10}$/.test(tmdb || tvdb)) throw new HttpError(400, "Give tmdb or tvdb as a number");
+    const d = await jellyfinJson(`/Items?Recursive=true&IncludeItemTypes=${type}&Fields=ProviderIds,ProductionYear,Path`);
+    const hit = d.Items.find((i) => (tmdb && i.ProviderIds?.Tmdb === tmdb) || (tvdb && i.ProviderIds?.Tvdb === tvdb));
+    if (!hit) return json(res, 404, { error: "Not in Jellyfin yet" });
+    const found = { itemId: hit.Id, name: hit.Name, year: hit.ProductionYear, type: hit.Type, path: hit.Path };
+    if (hit.Type === "Series") {
+      const episodes = await jellyfinJson(`/Shows/${hit.Id}/Episodes?Fields=MediaSources`);
+      found.seasons = {};
+      for (const e of episodes.Items) {
+        if (e.LocationType === "Virtual" || !e.MediaSources?.length) continue;
+        found.seasons[e.ParentIndexNumber ?? 0] = (found.seasons[e.ParentIndexNumber ?? 0] || 0) + 1;
+      }
+    }
+    return json(res, 200, found);
+  }
   // GET /api/seasons/<seriesId>   seasons with at least one downloaded episode
   let m = p.match(/^\/api\/seasons\/([0-9a-f-]{32,36})$/i);
   if (req.method === "GET" && m) {
