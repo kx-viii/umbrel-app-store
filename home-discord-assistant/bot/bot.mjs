@@ -1322,7 +1322,7 @@ const statusMessage = (req) => ({ content: "", embeds: [matchEmbed(req)], compon
 function readyMessage(req, until) {
   const watch = new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(req.share.url).setLabel("Watch now").setEmoji("▶️");
   return {
-    content: `${pingPeople(req).content} **${cinemaPostName(req)}** is ready to watch 🍿\n-# The link expires <t:${until}:R>.`,
+    content: `${pingPeople(req).content} **${readyName(req)}** is ready to watch 🍿\n-# The link expires <t:${until}:R>.`,
     components: buttonRow(watch),
     allowedMentions: pingPeople(req).allowedMentions,
   };
@@ -1338,17 +1338,19 @@ async function updateStatusMessage(req) {
 }
 
 // ---- Cinema posts
-// Films are "Title (year)"; shows carry the seasons, like "Severance S2", as the forum asks.
+// One post per title: films are "Title (year)", shows just "Title", so every season of a show shares a post.
 const cinemaPostName = (req) => {
   const c = requestCandidate(req);
-  return (req.type === "tv" ? `${c.title} ${seasonLabel(req.seasons)}` : `${c.title}${c.year ? ` (${c.year})` : ""}`).slice(0, 100);
+  return (req.type === "tv" ? c.title : `${c.title}${c.year ? ` (${c.year})` : ""}`).slice(0, 100);
 };
+// What's ready, as said in the post: the post's name plus the seasons, like "The Bear S3–5".
+const readyName = (req) => `${cinemaPostName(req)}${req.type === "tv" ? ` ${seasonLabel(req.seasons)}` : ""}`;
 
 // The title's post in the cinema forum: the one the bot made before, one someone made by hand with the same name,
 // or a new one with the art and the right tv/film/anime tag.
 async function findOrCreateCinemaPost(req) {
   media.posts ??= {};
-  const key = `${req.type}:${req.tmdbId}:${req.type === "tv" ? req.seasons.join(",") : ""}`;
+  const key = `${req.type}:${req.tmdbId}`;
   const known = media.posts[key] ? await discord.channels.fetch(media.posts[key]).catch(() => null) : null;
   if (known) return known;
 
@@ -1356,7 +1358,7 @@ async function findOrCreateCinemaPost(req) {
   const c = requestCandidate(req);
   const [active, archived] = await Promise.all([forum.threads.fetchActive(), forum.threads.fetchArchived({ limit: 100 })]);
   const threads = [...active.threads.values(), ...archived.threads.values()].filter((t) => t.parentId === forum.id);
-  const names = [cinemaPostName(req), ...(req.type === "movie" ? [c.title] : [])].map(normTitle);
+  const names = [cinemaPostName(req), c.title, `${c.title}${c.year ? ` (${c.year})` : ""}`].map(normTitle);
   let thread = threads.find((t) => names.includes(normTitle(t.name)));
   if (!thread) {
     const tagName = req.anime ? "anime" : req.type === "tv" ? "tv" : "film";
@@ -1705,7 +1707,7 @@ async function expireRequest(req) {
   saveMedia();
   const thread = await updateStatusMessage(req); // the post is the title's general post, so it stays open
   if (thread && req.linkMessageId) {
-    await thread.messages.edit(req.linkMessageId, { content: `**${cinemaPostName(req)}**: the watch link has expired.`, components: [], allowedMentions: { parse: [] } })
+    await thread.messages.edit(req.linkMessageId, { content: `**${readyName(req)}**: the watch link has expired.`, components: [], allowedMentions: { parse: [] } })
       .catch((e) => console.error("Couldn't edit the expired link:", e.message));
   }
   if (!needsCleanup || !STAFF_CHANNEL_ID) return;
