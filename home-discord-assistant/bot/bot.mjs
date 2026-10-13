@@ -1107,7 +1107,7 @@ const MEDIA_STATUS = {
   requested: { colour: 0x5865f2, footer: "Waiting for approval." },
   approved: { colour: 0x57f287, footer: "Approved. Looking for a download." },
   downloading: { colour: 0xfee75c },
-  ready: { colour: 0xeb459e, footer: "Ready. The watch link is below." },
+  ready: { colour: 0xeb459e, footer: "Ready to watch." },
   declined: { colour: 0xed4245, footer: "Declined." },
   expired: { colour: 0x4f545c, footer: "The watch link has expired." },
 };
@@ -1118,7 +1118,7 @@ Press **Make a request** or use \`/request\`.
 **Season(s):** shows only, e.g. \`1\`, \`1-3\` or \`all\`. Leave it empty for season 1.
 
 - Check the match and press **That's it**.
-- Once it's approved, it gets a post in <#${MEDIA_FORUM_ID}> and you're pinged there. When it's ready, the watch link is posted there too. Links last ${MEDIA_LINK_HOURS} hours.
+- Once it's approved, it gets a post in <#${MEDIA_FORUM_ID}>. You're pinged there with a watch link when it's ready. Links last ${MEDIA_LINK_HOURS} hours.
 - If someone has already asked for it, you're added to theirs instead.`;
 
 function loadMedia() {
@@ -1290,13 +1290,15 @@ function matchEmbed(req, { big = false } = {}) {
     .setURL(`https://www.themoviedb.org/${req.type}/${c.id}`)
     .setColor(MEDIA_STATUS[req.status].colour)
     .setFooter({ text: req.status === "downloading" ? `Downloading: ${req.progress ?? 0}%` : MEDIA_STATUS[req.status].footer });
-  if (c.overview) embed.setDescription(c.overview.length > 300 ? `${c.overview.slice(0, 297)}…` : c.overview);
+  const overview = c.overview?.length > 300 ? `${c.overview.slice(0, 297)}…` : c.overview ?? "";
+  const details = [
+    req.type === "tv" ? `Show · ${seasonLabel(req.seasons)}` : "Film",
+    ...(req.status !== "matching" ? [`requested by <@${req.by}>`] : []),
+    ...(req.viewers.length ? [`+${req.viewers.length} more`] : []),
+  ].join(" · ");
+  embed.setDescription(`${overview ? `${overview}\n\n` : ""}**${details}**`);
   if (c.poster) embed.setThumbnail(`${TMDB_IMAGES}w342${c.poster}`);
   if (big && c.backdrop) embed.setImage(`${TMDB_IMAGES}w780${c.backdrop}`);
-  embed.addFields({ name: "Type", value: req.type === "tv" ? "Show" : "Film", inline: true });
-  if (req.type === "tv") embed.addFields({ name: "Seasons", value: seasonLabel(req.seasons), inline: true });
-  if (req.status !== "matching") embed.addFields({ name: "Requested by", value: `<@${req.by}>`, inline: true });
-  if (req.viewers.length) embed.addFields({ name: "Also wants it", value: String(req.viewers.length), inline: true });
   if (req.notes && req.status !== "matching") embed.addFields({ name: "Notes", value: req.notes.slice(0, 300) });
   return embed;
 }
@@ -1315,6 +1317,16 @@ function matchPrompt(req) {
 
 // The request's message in its cinema post, edited as it moves along.
 const statusMessage = (req) => ({ content: "", embeds: [matchEmbed(req)], components: [], allowedMentions: { parse: [] } });
+
+// The ready ping in the post: who it's for, what's ready, and a Watch now button with the link.
+function readyMessage(req, until) {
+  const watch = new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(req.share.url).setLabel("Watch now").setEmoji("▶️");
+  return {
+    content: `${pingPeople(req).content} **${cinemaPostName(req)}** is ready to watch 🍿\n-# The link expires <t:${until}:R>.`,
+    components: buttonRow(watch),
+    allowedMentions: pingPeople(req).allowedMentions,
+  };
+}
 
 async function updateStatusMessage(req) {
   if (!req.postId || !req.statusMessageId) return null;
@@ -1485,7 +1497,6 @@ async function handleMediaButton(interaction) {
     req.postId = thread.id;
     req.statusMessageId = (await thread.send(statusMessage(req))).id;
     saveMedia();
-    await thread.send({ ...pingPeople(req), content: `${pingPeople(req).content} Accepted. You'll be pinged here with the watch link when it's ready.` });
     await closeCard(`✅ Approved by ${by}: ${thread.url}`);
     console.log(`[media] approved ${requestName(req)} (${req.owned ? "already in the library" : req.arr?.added ? "added" : "searching"})`);
     return checkRequest(req).catch((e) => console.error("Request check failed:", e.message));
@@ -1538,7 +1549,7 @@ async function confirmRequest(interaction, req) {
   req.staffMessageId = card.id;
   saveMedia();
   console.log(`[media] ${req.byName} requested ${requestName(req)}`);
-  return tell(`Request sent: **${requestName(req)}**. You'll be pinged when it's accepted.`);
+  return tell(`Request sent: **${requestName(req)}**. You'll be pinged when it's ready.`);
 }
 
 // ---- Downloading
@@ -1654,7 +1665,7 @@ async function checkRequest(req) {
   saveMedia();
   const thread = await updateStatusMessage(req);
   const until = Math.floor(req.share.expiresAt / 1000);
-  const sent = await thread?.send({ ...pingPeople(req), content: `${pingPeople(req).content} **${requestName(req)}** is ready: ${req.share.url}\n-# The link works until <t:${until}:f> (<t:${until}:R>).` });
+  const sent = await thread?.send(readyMessage(req, until));
   if (sent) { req.linkMessageId = sent.id; saveMedia(); }
   console.log(`[media] ready: ${requestName(req)}`);
 }
@@ -1694,7 +1705,7 @@ async function expireRequest(req) {
   saveMedia();
   const thread = await updateStatusMessage(req); // the post is the title's general post, so it stays open
   if (thread && req.linkMessageId) {
-    await thread.messages.edit(req.linkMessageId, { content: `**${requestName(req)}**: the watch link has expired.`, allowedMentions: { parse: [] } })
+    await thread.messages.edit(req.linkMessageId, { content: `**${cinemaPostName(req)}**: the watch link has expired.`, components: [], allowedMentions: { parse: [] } })
       .catch((e) => console.error("Couldn't edit the expired link:", e.message));
   }
   if (!needsCleanup || !STAFF_CHANNEL_ID) return;
