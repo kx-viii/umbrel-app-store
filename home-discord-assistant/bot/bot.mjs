@@ -86,7 +86,7 @@ const REQUESTS_PER_PERSON = 3;      // change requests per person per day
 const REQUESTS_FILE = path.join(here, "requests.json");
 const REQUEST_TOOL = {
   name: "request_change",
-  description: "Send a request to the staff for approval. Use it when someone asks for something to be added, removed or changed: a game in the games forum, a game's server info (IP, modpack, password, how to join), channels, roles, anything else about the server, or a new feature or change for this bot. Never use it for questions.",
+  description: "Send a request for approval. Use it when someone asks for something to be added, removed or changed: a game in the games forum, a game's server info (IP, modpack, password, how to join), channels, roles, anything else about the server, or a new feature or change for this bot. Never use it for questions.",
   input_schema: {
     type: "object",
     properties: {
@@ -100,7 +100,7 @@ const REQUEST_TOOL = {
   },
   strict: true,
 };
-const REQUESTS_ON = `\n- You can't change the server yourself. If someone asks for a change (add or remove a game, change server info, channels, roles), call request_change so the staff can approve it.`;
+const REQUESTS_ON = `\n- You can't change the server yourself. If someone asks for a change (add or remove a game, change server info, channels, roles), call request_change so it can be approved.`;
 // Maintenance mode: staff can switch it on/off with /maintenance or by asking the bot.
 // On: members lose access to every channel (what's removed is recorded), @everyone loses View Channels,
 // and only the maintenance channel is visible. Off: everything recorded is put back exactly.
@@ -109,7 +109,7 @@ const MAINT_FILE = path.join(here, "maintenance.json");
 const LOCK_ROLE_IDS = () => MEMBER_ROLE_IDS.filter((id) => id !== STAFF_ROLE_ID); // member roles hidden during maintenance
 const MAINT_TOOL = {
   name: "set_maintenance",
-  description: "Turn the server's maintenance mode on or off, when a staff member asks to (e.g. 'turn off maintenance mode', 'put the server in maintenance').",
+  description: "Turn the server's maintenance mode on or off, when someone who runs the server asks to (e.g. 'turn off maintenance mode', 'put the server in maintenance').",
   input_schema: {
     type: "object",
     properties: { mode: { type: "string", enum: ["on", "off"] } },
@@ -118,14 +118,14 @@ const MAINT_TOOL = {
   },
   strict: true,
 };
-const MAINT_ON = `\n- This person is staff. If they ask to turn maintenance mode on or off, call set_maintenance.`;
+const MAINT_ON = `\n- This person helps run the server. If they ask to turn maintenance mode on or off, call set_maintenance.`;
 // Server updates: staff give rough notes (/update, or asking the bot); the bot writes a versioned post,
 // previews it in the staff channel with Post/Discard buttons, and posts it silently (no pings, no notification).
 const UPDATES_CHANNEL_ID = process.env.UPDATES_CHANNEL_ID || "";
 const UPDATES_FILE = path.join(here, "updates.json"); // { version, drafts: { id: { text, version } } }
 const UPDATE_TOOL = {
   name: "post_server_update",
-  description: "Draft a server update post from a staff member's notes, when they ask to post, write or announce a server update or changelog.",
+  description: "Draft a server update post from the notes of someone who runs the server, when they ask to post, write or announce a server update or changelog.",
   input_schema: {
     type: "object",
     properties: {
@@ -137,9 +137,9 @@ const UPDATE_TOOL = {
   },
   strict: true,
 };
-const UPDATE_ON = `\n- This person is staff. If they ask to post a server update or changelog, call post_server_update with their notes.`;
-// Media requests: members ask for a film or show with a form; each request becomes a post in the request forum.
-// Staff approve it there, it downloads into the hidden shared folders, and the requester gets a private watch link.
+const UPDATE_ON = `\n- This person helps run the server. If they ask to post a server update or changelog, call post_server_update with their notes.`;
+// Media requests: members ask for a film or show with a form; it's approved in the staff channel, downloads into the
+// hidden shared folders, and the watch link is posted in the title's post in the cinema forum.
 const MEDIA_REQUESTS_CHANNEL_ID = process.env.MEDIA_REQUESTS_CHANNEL_ID || "";
 const MEDIA_FORUM_ID = process.env.MEDIA_FORUM_ID || "";
 const SEERR_URL = (process.env.SEERR_URL || "").replace(/\/+$/, "");
@@ -578,7 +578,7 @@ async function draftServerUpdate(notes, bump, by) {
 }
 
 async function handleUpdateButton(interaction) {
-  if (!isStaff(interaction.member)) return interaction.reply({ content: "Only staff can do that.", ephemeral: true });
+  if (!isStaff(interaction.member)) return interaction.reply({ content: "You can't do that.", ephemeral: true });
   const [, action, id] = interaction.customId.split(":");
   const updates = loadUpdates();
   const draft = updates.drafts[id];
@@ -654,8 +654,8 @@ async function setMaintenance(guild, mode, by) {
     saveMaintenance({ on: true, removed, since: Date.now(), by });
     await everyone.setPermissions(everyone.permissions.remove(PermissionFlagsBits.ViewChannel), `Maintenance mode on (${by})`);
     await maintChannel.permissionOverwrites.edit(everyone, { ViewChannel: true }, { reason: "Maintenance mode on" });
-    staffAlert("maintenance", `🚧 Maintenance mode **on** (${by}). Only staff can see the server.`, 0);
-    return "Maintenance mode is on. Only staff can see the server now.";
+    staffAlert("maintenance", `🚧 Maintenance mode **on** (${by}). The server is hidden from everyone else.`, 0);
+    return "Maintenance mode is on. The server is hidden from everyone else now.";
   }
   if (!state.on && everyone.permissions.has(PermissionFlagsBits.ViewChannel)) return "Maintenance mode is already off.";
   for (const r of state.removed ?? []) {
@@ -672,14 +672,14 @@ async function setMaintenance(guild, mode, by) {
 
 discord.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isChatInputCommand() && interaction.commandName === "update") {
-    if (!isStaff(interaction.member)) return interaction.reply({ content: "Only staff can do that.", ephemeral: true });
+    if (!isStaff(interaction.member)) return interaction.reply({ content: "You can't do that.", ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
     const result = await draftServerUpdate(interaction.options.getString("notes"), interaction.options.getString("bump") ?? "minor", interaction.member.displayName)
       .catch((e) => `That didn't work: ${e.message}`);
     return interaction.editReply(result);
   }
   if (!interaction.isChatInputCommand() || interaction.commandName !== "maintenance") return;
-  if (!isStaff(interaction.member)) return interaction.reply({ content: "Only staff can do that.", ephemeral: true });
+  if (!isStaff(interaction.member)) return interaction.reply({ content: "You can't do that.", ephemeral: true });
   await interaction.deferReply({ ephemeral: true });
   try {
     const result = await setMaintenance(interaction.guild, interaction.options.getString("mode"), interaction.member.displayName);
@@ -696,7 +696,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isButton() || !interaction.customId.startsWith("req:")) return;
   const [, action, id] = interaction.customId.split(":");
   if (!interaction.member?.roles.cache.has(STAFF_ROLE_ID)) {
-    return interaction.reply({ content: "Only staff can approve or decline requests.", ephemeral: true });
+    return interaction.reply({ content: "You can't approve or decline requests.", ephemeral: true });
   }
   const requests = loadRequests();
   const request = requests[id];
@@ -708,7 +708,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (action === "approve") {
       const done = await applyRequest(interaction.guild, request);
-      outcome = done ? `✅ Approved by ${interaction.member.displayName}: ${done}` : `✅ Approved by ${interaction.member.displayName}. Staff will sort it.`;
+      outcome = done ? `✅ Approved by ${interaction.member.displayName}: ${done}` : `✅ Approved by ${interaction.member.displayName}. This one needs doing by hand.`;
       request.status = "approved";
     } else {
       outcome = `❌ Declined by ${interaction.member.displayName}.`;
@@ -1082,12 +1082,12 @@ discord.on(Events.MessageCreate, async (message) => {
 // Seerr and shows the match privately to them to confirm; then it goes to the staff channel with Approve/Decline.
 // On approval the bot adds it to Radarr/Sonarr itself, in the hidden shared folders that no Jellyfin user can see,
 // so it never shows up on anyone's TV, and posts its status in the title's post in the cinema forum (making the post
-// if there isn't one). Once it's in Jellyfin, Share makes a 48-hour watch link, which only the requester (and anyone
-// who pressed Me too) can reveal. When the link expires, staff choose to keep it (moved into the main library) or
+// if there isn't one). Once it's in Jellyfin, Share makes a 48-hour watch link, posted in that post for anyone
+// there to use. When the link expires, staff choose to keep it (moved into the main library) or
 // delete it; if nobody chooses, it's deleted. Things that were already in the library are just shared, and are
 // never deleted.
 const MEDIA_FILE = path.join(here, "media.json"); // { requests: { id: {...} }, posts: { "tv:<tmdb>:<seasons>": postId } }
-const MEDIA_PER_WEEK = 3;                         // confirmed requests per person per 7 days (Me too is free)
+const MEDIA_PER_WEEK = 3;                         // confirmed requests per person per 7 days (joining someone else's is free)
 const MEDIA_LINK_HOURS = 48;
 const MEDIA_CHECK_MS = 2 * 60_000;                // how often downloads and link expiry are checked
 const MEDIA_DRAFT_MS = 24 * 60 * 60_000;          // matches nobody confirmed are forgotten after this
@@ -1104,10 +1104,10 @@ const TMDB_IMAGES = "https://image.tmdb.org/t/p/";
 const OPEN_STATUSES = ["requested", "approved", "downloading", "ready"];
 const MEDIA_STATUS = {
   matching: { colour: 0x8a93a8, footer: "Is this the right one?" },
-  requested: { colour: 0x5865f2, footer: "Waiting for staff to approve it." },
+  requested: { colour: 0x5865f2, footer: "Waiting for approval." },
   approved: { colour: 0x57f287, footer: "Approved. Looking for a download." },
   downloading: { colour: 0xfee75c },
-  ready: { colour: 0xeb459e, footer: "Ready. Press Get my watch link." },
+  ready: { colour: 0xeb459e, footer: "Ready. The watch link is below." },
   declined: { colour: 0xed4245, footer: "Declined." },
   expired: { colour: 0x4f545c, footer: "The watch link has expired." },
 };
@@ -1117,9 +1117,8 @@ Press **Make a request** or use \`/request\`.
 **Title:** the name as it's listed, e.g. *The Bear* or *Spirited Away*. Add the **year** if there's more than one with that name.
 **Season(s):** shows only, e.g. \`1\`, \`1-3\` or \`all\`. Leave it empty for season 1.
 
-- Check the match and press **That's it**. Staff then approve it.
-- Once it's accepted, it gets a post in <#${MEDIA_FORUM_ID}> and you're pinged there. You're pinged again when it's ready.
-- **Get my watch link** only works for you, and for anyone who pressed **Me too**. Links last ${MEDIA_LINK_HOURS} hours.
+- Check the match and press **That's it**.
+- Once it's approved, it gets a post in <#${MEDIA_FORUM_ID}> and you're pinged there. When it's ready, the watch link is posted there too. Links last ${MEDIA_LINK_HOURS} hours.
 - ${MEDIA_PER_WEEK} requests a week each. If someone has already asked for it, you're added to theirs instead, and it doesn't use one of yours.`;
 
 function loadMedia() {
@@ -1278,7 +1277,7 @@ function joinRequest(req, userId) {
     saveMedia();
     updateStatusMessage(req).catch(() => {});
   }
-  if (req.status === "ready") return `**${requestName(req)}** is ready. Press **Get my watch link** in <#${req.postId}>.`;
+  if (req.status === "ready") return `**${requestName(req)}** is ready. The watch link is in <#${req.postId}>.`;
   return `**${requestName(req)}** has already been requested, so I've added you to it. You'll be pinged ${req.postId ? `in <#${req.postId}> ` : ""}when it's ready.`;
 }
 
@@ -1315,14 +1314,7 @@ function matchPrompt(req) {
 }
 
 // The request's message in its cinema post, edited as it moves along.
-function statusMessage(req) {
-  const metoo = mediaButton("metoo", req, "Me too", ButtonStyle.Secondary, "🙋");
-  const buttons = {
-    approved: [metoo], downloading: [metoo],
-    ready: [mediaButton("link", req, "Get my watch link", ButtonStyle.Primary, "🔗"), metoo],
-  }[req.status] ?? [];
-  return { content: "", embeds: [matchEmbed(req)], components: buttons.length ? buttonRow(...buttons) : [], allowedMentions: { parse: [] } };
-}
+const statusMessage = (req) => ({ content: "", embeds: [matchEmbed(req)], components: [], allowedMentions: { parse: [] } });
 
 async function updateStatusMessage(req) {
   if (!req.postId || !req.statusMessageId) return null;
@@ -1461,7 +1453,7 @@ async function handleMediaButton(interaction) {
   }
 
   if (action === "approve" || action === "decline") {
-    if (!staff) return reply("Only staff can approve or decline requests.");
+    if (!staff) return reply("You can't approve or decline requests.");
     if (req.status !== "requested") return reply("That request has already been dealt with.");
     await interaction.deferUpdate();
     const by = interaction.member.displayName;
@@ -1493,31 +1485,14 @@ async function handleMediaButton(interaction) {
     req.postId = thread.id;
     req.statusMessageId = (await thread.send(statusMessage(req))).id;
     saveMedia();
-    await thread.send({ ...pingPeople(req), content: `${pingPeople(req).content} Accepted. Your watch link will be ready shortly, and you'll be notified when it is.` });
+    await thread.send({ ...pingPeople(req), content: `${pingPeople(req).content} Accepted. You'll be pinged here with the watch link when it's ready.` });
     await closeCard(`✅ Approved by ${by}: ${thread.url}`);
     console.log(`[media] approved ${requestName(req)} (${req.owned ? "already in the library" : req.arr?.added ? "added" : "searching"})`);
     return checkRequest(req).catch((e) => console.error("Request check failed:", e.message));
   }
 
-  if (action === "metoo") {
-    if (!OPEN_STATUSES.includes(req.status)) return reply("This one's finished.");
-    if (!isMemberish(interaction.member)) return reply("Requests are for members only.");
-    if (requestPeople(req).includes(interaction.user.id)) return reply("You're already on this one.");
-    req.viewers.push(interaction.user.id);
-    saveMedia();
-    await reply(req.status === "ready" ? "Added. Press **Get my watch link** to watch it." : "Added. You'll be pinged when it's ready.");
-    return updateStatusMessage(req).catch(() => {});
-  }
-
-  if (action === "link") {
-    if (!requestPeople(req).includes(interaction.user.id) && !staff) return reply("This one isn't yours. Press **Me too** if you want it as well.");
-    if (req.status !== "ready" || !req.share || Date.now() > req.share.expiresAt) return reply("That link has expired.");
-    const until = Math.floor(req.share.expiresAt / 1000);
-    return reply(`**${requestName(req)}**: ${req.share.url}\nWorks until <t:${until}:f> (<t:${until}:R>). It's just for you, so don't share it.`);
-  }
-
   if (action === "keep" || action === "delete") {
-    if (!staff) return reply("Only staff can do that.");
+    if (!staff) return reply("You can't do that.");
     if (req.cleanup?.state !== "pending") return reply("That's already been dealt with.");
     await interaction.deferUpdate();
     return finishCleanup(req, action, interaction.member.displayName);
@@ -1678,7 +1653,9 @@ async function checkRequest(req) {
   req.readyAt = Date.now();
   saveMedia();
   const thread = await updateStatusMessage(req);
-  await thread?.send({ ...pingPeople(req), content: `${pingPeople(req).content} **${requestName(req)}** is ready. Press **Get my watch link** above. The link works for ${MEDIA_LINK_HOURS} hours.` });
+  const until = Math.floor(req.share.expiresAt / 1000);
+  const sent = await thread?.send({ ...pingPeople(req), content: `${pingPeople(req).content} **${requestName(req)}** is ready: ${req.share.url}\n-# The link works until <t:${until}:f> (<t:${until}:R>).` });
+  if (sent) { req.linkMessageId = sent.id; saveMedia(); }
   console.log(`[media] ready: ${requestName(req)}`);
 }
 
@@ -1715,7 +1692,11 @@ async function expireRequest(req) {
   const needsCleanup = !req.owned && Boolean(req.arr?.added || req.arr?.addedSeasons?.length);
   if (needsCleanup) req.cleanup = { state: "pending", deadline: Date.now() + MEDIA_CLEANUP_MS };
   saveMedia();
-  await updateStatusMessage(req); // the post is the title's general post, so it stays open
+  const thread = await updateStatusMessage(req); // the post is the title's general post, so it stays open
+  if (thread && req.linkMessageId) {
+    await thread.messages.edit(req.linkMessageId, { content: `**${requestName(req)}**: the watch link has expired.`, allowedMentions: { parse: [] } })
+      .catch((e) => console.error("Couldn't edit the expired link:", e.message));
+  }
   if (!needsCleanup || !STAFF_CHANNEL_ID) return;
   const staffChannel = await discord.channels.fetch(STAFF_CHANNEL_ID);
   const deadline = Math.floor(req.cleanup.deadline / 1000);
@@ -1846,7 +1827,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
   } catch (error) {
     console.error("Media request failed:", error.message);
     staffAlert("media-error", `⚠️ Bot problem with a media request: ${error.message.slice(0, 200)}`);
-    const reply = { content: "Something went wrong with that. Staff have been told.", ephemeral: true };
+    const reply = { content: "Something went wrong with that. I've flagged it.", ephemeral: true };
     if (interaction.deferred || interaction.replied) await interaction.followUp(reply).catch(() => {});
     else await interaction.reply(reply).catch(() => {});
   }
