@@ -1,0 +1,48 @@
+manifestVersion: 1.1
+id: home-share
+category: media
+name: Share
+version: "1.0.0"
+tagline: Expiring watch links for films and shows in Jellyfin
+icon: https://raw.githubusercontent.com/kx-viii/umbrel-app-store/main/home-share/icon.svg
+description: >-
+  Make a link to a film, a season or a whole show in your Jellyfin library that anyone can watch in their browser,
+  with no app or account. Links stop working after the time you pick (48 hours by default, a week at most).
+
+
+  Video is converted on the fly by Jellyfin to H.264 and AAC, so MKV and HEVC files play on phones, laptops and
+  smart-TV browsers. Jellyfin's hardware transcoding settings are used if you've set them up. English subtitles
+  are included when the file has text subtitles, and people can download the original file instead.
+  Your Jellyfin key never leaves the Umbrel, and a link only reaches the items it was made for.
+
+
+  🛠️ SET-UP INSTRUCTIONS
+
+
+  1. In Jellyfin, go to Dashboard > API Keys and add a key called Share.
+
+  2. Create the file .env in this app's data folder (Files > Apps > home-share > data) containing
+  JELLYFIN_API_KEY=<the key> and PUBLIC_URL=<the address links should start with>, then restart the app.
+
+  3. Watch pages are served on port 8486, on the Umbrel only. To make links work for people outside your network,
+  open the Tailscale app's terminal and run: tailscale funnel --bg --https=8443 http://127.0.0.1:8486
+  Then set PUBLIC_URL to https://<this machine>.<your tailnet>.ts.net:8443
+
+
+  Other apps can make links through the API on http://home-share_web_1:8080/api with the token saved in
+  data/api-token: POST /api/shares with {"itemId": "<Jellyfin id>", "season": 1, "hours": 48}.
+releaseNotes: "First version."
+developer: home
+website: https://github.com/kx-viii/umbrel-app-store
+dependencies:
+  - jellyfin
+repo: https://github.com/kx-viii/umbrel-app-store
+support: https://github.com/kx-viii/umbrel-app-store/issues
+port: 8485
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+torOnly: false
+submitter: home
+submission: ""
