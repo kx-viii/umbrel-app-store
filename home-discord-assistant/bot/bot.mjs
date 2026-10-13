@@ -16,6 +16,9 @@
 //   MONTHLY_BUDGET_USD                     staff are warned at 50%, 80% and 100% of this estimated monthly spend
 //   ROOMS_CATEGORY_ID, MEMBER_ROLE_IDS     game rooms: the category temporary voice rooms go in, and the
 //                                          role ids (comma-separated) allowed to ask for one
+//   MEDIA_REQUESTS_CHANNEL_ID, MEDIA_FORUM_ID   film/show requests: the channel with the request button, and the
+//                                          forum each request gets a post in (members = MEMBER_ROLE_IDS)
+//   SEERR_URL/_API_KEY, RADARR_URL/_API_KEY, SONARR_URL/_API_KEY, SHARE_URL, SHARE_TOKEN   the media apps they use
 // Run with: npm start
 
 import fs from "node:fs";
@@ -24,7 +27,8 @@ import { fileURLToPath } from "node:url";
 import Anthropic from "@anthropic-ai/sdk";
 import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, EmbedBuilder, Events, GatewayIntentBits,
-  MessageFlags, OverwriteType, Partials, PermissionFlagsBits, Routes, SlashCommandBuilder,
+  LabelBuilder, MessageFlags, ModalBuilder, OverwriteType, Partials, PermissionFlagsBits, Routes, SlashCommandBuilder,
+  StringSelectMenuBuilder, TextInputBuilder, TextInputStyle,
 } from "discord.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -134,6 +138,17 @@ const UPDATE_TOOL = {
   strict: true,
 };
 const UPDATE_ON = `\n- This person is staff. If they ask to post a server update or changelog, call post_server_update with their notes.`;
+// Media requests: members ask for a film or show with a form; each request becomes a post in the request forum.
+// Staff approve it there, it downloads into the hidden shared folders, and the requester gets a private watch link.
+const MEDIA_REQUESTS_CHANNEL_ID = process.env.MEDIA_REQUESTS_CHANNEL_ID || "";
+const MEDIA_FORUM_ID = process.env.MEDIA_FORUM_ID || "";
+const SEERR_URL = (process.env.SEERR_URL || "").replace(/\/+$/, "");
+const RADARR_URL = (process.env.RADARR_URL || "").replace(/\/+$/, "");
+const SONARR_URL = (process.env.SONARR_URL || "").replace(/\/+$/, "");
+const SHARE_URL = (process.env.SHARE_URL || "").replace(/\/+$/, "");
+const MEDIA_ON = Boolean(MEDIA_REQUESTS_CHANNEL_ID && MEDIA_FORUM_ID && SEERR_URL && process.env.SEERR_API_KEY && RADARR_URL &&
+  process.env.RADARR_API_KEY && SONARR_URL && process.env.SONARR_API_KEY && SHARE_URL && process.env.SHARE_TOKEN);
+const MEDIA_HINT = `\n- If someone asks you to get, download or add a film or show, tell them to use /request or the button in <#${MEDIA_REQUESTS_CHANNEL_ID}>. You can't request it yourself.`;
 // Game tags: every post in the games forum gets a ping role; reacting with the post's title emoji
 // (or TAG_EMOJI if it has none) on its first message gives you the role, removing it takes it away.
 const GAMES_FORUM_ID = process.env.GAMES_FORUM_ID || "";
@@ -253,7 +268,13 @@ discord.once(Events.ClientReady, (c) => {
   console.log(`Logged in as ${c.user.tag}. Model ${MODEL}, ask channel ${ASK_CHANNEL_ID || "none (mentions only)"}.`);
   if (ROOMS_CATEGORY_ID) setInterval(cleanUpRooms, 60_000);
   if (GAMES_FORUM_ID) setupAllGameTags().catch((e) => console.error("Game tag setup failed:", e.message));
-  if (MAINT_CHANNEL_ID && STAFF_ROLE_ID) registerCommands().catch((e) => console.error("Couldn't register /maintenance:", e.message));
+  registerCommands().catch((e) => console.error("Couldn't register slash commands:", e.message));
+  if (MEDIA_ON) {
+    ensureRequestPanel().catch((e) => console.error("Request panel setup failed:", e.message));
+    checkMediaApps();
+    setTimeout(checkMediaRequests, 40_000);
+    setInterval(checkMediaRequests, MEDIA_CHECK_MS);
+  }
   if (STREAMERS.length) {
     console.log(`Live alerts for: ${STREAMERS.join(", ")}`);
     setTimeout(checkStreams, 20_000);
@@ -587,7 +608,7 @@ function saveMaintenance(state) {
 }
 const isStaff = (member) => Boolean(member?.roles.cache.has(STAFF_ROLE_ID));
 
-// /maintenance, only visible to people who can manage roles (the staff role can).
+// /maintenance and /update, only visible to people who can manage roles (the staff role can), and /request for everyone.
 async function registerCommands() {
   const command = new SlashCommandBuilder()
     .setName("maintenance")
@@ -600,8 +621,15 @@ async function registerCommands() {
     .addStringOption((o) => o.setName("notes").setDescription("What changed, rough notes are fine").setRequired(true))
     .addStringOption((o) => o.setName("bump").setDescription("minor (default) or major version").addChoices({ name: "minor", value: "minor" }, { name: "major", value: "major" }))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles);
-  const channel = await discord.channels.fetch(MAINT_CHANNEL_ID);
-  const commands = [command.toJSON(), ...(UPDATES_CHANNEL_ID ? [update.toJSON()] : [])];
+  const request = new SlashCommandBuilder().setName("request").setDescription("Request a film or show");
+  const staffReady = Boolean(MAINT_CHANNEL_ID && STAFF_ROLE_ID);
+  const commands = [
+    ...(staffReady ? [command.toJSON()] : []),
+    ...(staffReady && UPDATES_CHANNEL_ID ? [update.toJSON()] : []),
+    ...(MEDIA_ON ? [request.toJSON()] : []),
+  ];
+  if (!commands.length) return;
+  const channel = await discord.channels.fetch(MAINT_CHANNEL_ID || MEDIA_REQUESTS_CHANNEL_ID);
   await discord.rest.put(Routes.applicationGuildCommands(discord.user.id, channel.guildId), { body: commands });
 }
 
@@ -992,7 +1020,7 @@ discord.on(Events.MessageCreate, async (message) => {
       max_tokens: MAX_TOKENS,
       output_config: { effort: "medium" },
       ...(tools.length && { tools }),
-      system: systemPrompt(discord.user.username, message.guild.name, canSearch) + (ROOMS_CATEGORY_ID ? (canMakeRooms ? ROOMS_ON : ROOMS_OFF) : "") + (canRequest ? REQUESTS_ON : "") + (canMaintain ? MAINT_ON : "") + (canUpdate ? UPDATE_ON : ""),
+      system: systemPrompt(discord.user.username, message.guild.name, canSearch) + (ROOMS_CATEGORY_ID ? (canMakeRooms ? ROOMS_ON : ROOMS_OFF) : "") + (canRequest ? REQUESTS_ON : "") + (canMaintain ? MAINT_ON : "") + (canUpdate ? UPDATE_ON : "") + (MEDIA_ON ? MEDIA_HINT : ""),
       messages: [{
         role: "user",
         content:
@@ -1046,6 +1074,728 @@ discord.on(Events.MessageCreate, async (message) => {
     writeStatus();
     staffAlert(`claude-${error?.type ?? error?.status ?? "error"}`, `⚠️ Bot problem: ${friendlyError(error)}\n-# ${error?.status ?? ""} ${error?.type ?? ""} ${String(error?.message ?? "").slice(0, 200)}`);
     await message.reply(friendlyError(error)).catch(() => {});
+  }
+});
+
+// ---- Media requests ---------------------------------------------------------
+// A member fills in the form (/request or the button in the requests channel). The bot finds the film or show in
+// Seerr and opens a post in the request forum with the match; the requester confirms it, and staff approve it in the
+// post. The bot then adds it to Radarr/Sonarr itself, in the hidden shared folders that no Jellyfin user can see,
+// so it never shows up on anyone's TV. Once it's in Jellyfin, Share makes a 48-hour watch link, which only the
+// requester (and anyone who pressed Me too) can reveal. When the link expires, staff choose to keep it (moved into
+// the main library) or delete it; if nobody chooses, it's deleted. Things that were already in the library are just
+// shared, and are never deleted.
+const MEDIA_FILE = path.join(here, "media.json"); // { requests: { postId: {...} } }
+const MEDIA_PER_WEEK = 3;                         // confirmed requests per person per 7 days (Me too is free)
+const MEDIA_LINK_HOURS = 48;
+const MEDIA_CHECK_MS = 2 * 60_000;                // how often downloads and link expiry are checked
+const MEDIA_DRAFT_MS = 24 * 60 * 60_000;          // posts nobody confirmed are removed after this
+const MEDIA_CLEANUP_MS = 72 * 60 * 60_000;        // expired downloads nobody chose to keep are deleted after this
+const MEDIA_STUCK_MS = 12 * 60 * 60_000;          // staff are told if nothing has started downloading by then
+const MEDIA_FORGET_MS = 30 * 24 * 60 * 60_000;    // finished requests are forgotten after this
+const QUALITY_PROFILE_ID = Number(process.env.MEDIA_QUALITY_PROFILE_ID) || 4; // HD-1080p, the same as Seerr uses
+const SHARED_ROOT = "/downloads/shared/";
+const SHARED_FOLDER = { movie: "/downloads/shared/movies", tv: "/downloads/shared/shows" };
+const LIBRARY_FOLDER = { movie: "/downloads/movies", animeMovie: "/downloads/anime-movies", tv: "/downloads/shows", animeTv: "/downloads/anime" };
+const ARR_TAG = { regular: 1, anime: 2 };         // the indexers are picked by tag: anime only searches Nyaa
+const ANIME_KEYWORD = 210024;                     // TMDB's "anime" keyword
+const TMDB_IMAGES = "https://image.tmdb.org/t/p/";
+const OPEN_STATUSES = ["requested", "approved", "downloading", "ready"];
+const MEDIA_STATUS = {
+  matching: { colour: 0x8a93a8, footer: "Is this the right one? Press That's it, or Not this one to see the next match." },
+  requested: { tag: "Requested", colour: 0x5865f2, footer: "Waiting for staff to approve it." },
+  approved: { tag: "Approved", colour: 0x57f287, footer: "Approved. Looking for a download." },
+  downloading: { tag: "Downloading", colour: 0xfee75c },
+  ready: { tag: "Ready", colour: 0xeb459e, footer: "Ready. Press Get my watch link." },
+  declined: { tag: "Declined", colour: 0xed4245, footer: "Declined." },
+  expired: { tag: "Expired", colour: 0x4f545c, footer: "The watch link has expired." },
+};
+const PANEL_TEXT = () => `## 🎬 Film and show requests
+Press **Make a request** or use \`/request\`. Each request gets its own post in <#${MEDIA_FORUM_ID}>, where you can follow it.
+
+**Title:** the name as it's listed, e.g. *The Bear* or *Spirited Away*. Add the **year** if there's more than one with that name.
+**Season(s):** shows only, e.g. \`1\`, \`1-3\` or \`all\`. Leave it empty for season 1.
+
+- Check the match in your post and press **That's it**. Staff approve it from there.
+- You're pinged when it's accepted, and again when it's ready.
+- **Get my watch link** only works for you, and for anyone who pressed **Me too**. Links last ${MEDIA_LINK_HOURS} hours.
+- ${MEDIA_PER_WEEK} requests a week each. If someone has already asked for it, press **Me too** on their post instead. That doesn't use one of yours.`;
+
+function loadMedia() {
+  try { return JSON.parse(fs.readFileSync(MEDIA_FILE, "utf8")); } catch { return { requests: {} }; }
+}
+const media = loadMedia(); // kept in memory and saved after every change, so the checks and button presses share it
+function saveMedia() {
+  try { fs.writeFileSync(MEDIA_FILE, JSON.stringify(media, null, 2)); } catch (e) { console.error("Couldn't save media requests:", e.message); }
+}
+
+// One small JSON client for the media apps. Keys go in headers only, never in URLs or errors.
+async function mediaApi(base, auth, pathAndQuery, { method = "GET", body } = {}) {
+  const res = await fetch(base + pathAndQuery, {
+    method, headers: { "Content-Type": "application/json", ...auth },
+    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(30_000),
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!res.ok) {
+    const detail = typeof data === "string" ? data : data?.message ?? data?.error ?? (Array.isArray(data) ? data.map((d) => d.errorMessage).join("; ") : "");
+    const error = new Error(`${method} ${pathAndQuery.split("?")[0]} failed (${res.status}) ${String(detail ?? "").slice(0, 200)}`.trim());
+    error.status = res.status;
+    throw error;
+  }
+  return data;
+}
+const seerr = (p, o) => mediaApi(SEERR_URL, { "X-Api-Key": process.env.SEERR_API_KEY }, p, o);
+const radarr = (p, o) => mediaApi(RADARR_URL, { "X-Api-Key": process.env.RADARR_API_KEY }, p, o);
+const sonarr = (p, o) => mediaApi(SONARR_URL, { "X-Api-Key": process.env.SONARR_API_KEY }, p, o);
+const shareApi = (p, o) => mediaApi(SHARE_URL, { Authorization: `Bearer ${process.env.SHARE_TOKEN}` }, p, o);
+
+// ---- Matching
+// "The Bear" and "the bear!" are the same title.
+const normTitle = (s) => String(s ?? "").toLowerCase().normalize("NFKD").replace(/[̀-ͯ]/g, "").replace(/&/g, "and")
+  .replace(/^the\s+/, "").replace(/[^a-z0-9]+/g, "");
+const toCandidate = (r) => ({
+  id: r.id, title: r.title ?? r.name, year: Number((r.releaseDate ?? r.firstAirDate ?? "").slice(0, 4)) || null,
+  poster: r.posterPath ?? null, backdrop: r.backdropPath ?? null, overview: String(r.overview ?? "").slice(0, 400),
+});
+
+async function seerrSearch(query, type) {
+  const found = [];
+  for (const page of [1, 2]) {
+    // Seerr rejects some characters encodeURIComponent leaves alone (e.g. the ' in Ocean's Eleven).
+    const q = encodeURIComponent(query).replace(/[!'()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+    const d = await seerr(`/search?query=${q}&page=${page}&language=en`);
+    found.push(...d.results.filter((r) => r.mediaType === type));
+    if (page >= d.totalPages || found.length >= 10) break;
+  }
+  return found.slice(0, 10).map(toCandidate);
+}
+
+// Best match first, then the rest in Seerr's order (most popular first), for "Not this one" to step through.
+async function findMatches(title, year, type) {
+  const byYear = (list) => [...list].sort((a, b) => yearScore(a) - yearScore(b));
+  const yearScore = (c) => (!year ? 0 : c.year === year ? 0 : c.year && Math.abs(c.year - year) <= 1 ? 1 : 2);
+  const exactFirst = (list, wanted) => {
+    const exact = byYear(list.filter((c) => normTitle(c.title) === normTitle(wanted)));
+    return exact.length ? [...exact, ...list.filter((c) => !exact.includes(c))] : null;
+  };
+  let list = await seerrSearch(title, type);
+  const exact = exactFirst(list, title);
+  if (exact) return exact;
+  // No exact title: let Claude pick from the results, or suggest a better search ("the f1 movie" -> "F1").
+  const pick = await pickMatchWithClaude(title, year, type, list);
+  if (pick.index >= 0 && list[pick.index]) return [list[pick.index], ...list.filter((_, i) => i !== pick.index)];
+  if (pick.search && normTitle(pick.search) !== normTitle(title)) {
+    list = await seerrSearch(pick.search, type);
+    return exactFirst(list, pick.search) ?? byYear(list);
+  }
+  return byYear(list);
+}
+
+async function pickMatchWithClaude(title, year, type, list) {
+  const kind = type === "tv" ? "TV show" : "film";
+  const options = list.map((c, i) => `${i}. ${c.title}${c.year ? ` (${c.year})` : ""}: ${c.overview.slice(0, 150)}`).join("\n");
+  try {
+    const response = await anthropic.messages.create({
+      model: MODEL, max_tokens: 200, output_config: { effort: "low" },
+      system: "You match a member's film or TV request to a search result. Reply with JSON only: {\"index\": <number of the result they mean, or -1 if none fit>, \"search\": \"<if none fit, the official title to search for instead; otherwise empty>\"}",
+      messages: [{ role: "user", content: `They asked for a ${kind}: "${title}"${year ? ` from ${year}` : ""}.\n\nSearch results:\n${options || "(none)"}` }],
+    });
+    addSpend(response.usage.input_tokens * PRICE_IN + response.usage.output_tokens * PRICE_OUT);
+    const text = response.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+    const json = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
+    return { index: Number.isInteger(json.index) ? json.index : -1, search: String(json.search ?? "").slice(0, 100) };
+  } catch (error) {
+    console.error("Match pick failed:", error.message);
+    return { index: -1, search: "" };
+  }
+}
+
+// "1", "1, 3", "1-3", "all" -> [1], [1, 3], [1, 2, 3], "all". Empty means season 1. null if it can't be read.
+function parseSeasons(text) {
+  const t = String(text ?? "").toLowerCase().trim();
+  if (!t) return [1];
+  if (/\ball\b|\bevery/.test(t)) return "all";
+  const seasons = new Set();
+  for (const part of t.replace(/[a-z]+/g, " ").split(/[,&+/]/)) {
+    const m = part.trim().match(/^(\d{1,3})(?:\s*(?:-|–|to)\s*(\d{1,3}))?$/);
+    if (!m) { if (part.trim()) return null; continue; }
+    const [a, b] = [Number(m[1]), Number(m[2] ?? m[1])];
+    for (let n = Math.min(a, b); n <= Math.max(a, b) && seasons.size < 100; n++) seasons.add(n);
+  }
+  return seasons.size ? [...seasons].sort((a, b) => a - b) : null;
+}
+
+function seasonLabel(seasons) {
+  if (seasons === "all") return "All seasons";
+  if (!seasons?.length) return "";
+  const runs = [];
+  for (const n of seasons) {
+    const last = runs.at(-1);
+    if (last && n === last[1] + 1) last[1] = n; else runs.push([n, n]);
+  }
+  return runs.map(([a, b]) => (a === b ? `S${a}` : `S${a}–${b}`)).join(", ");
+}
+
+const isAnime = (details) => Boolean(details.keywords?.some((k) => k.id === ANIME_KEYWORD) ||
+  (details.genres?.some((g) => g.id === 16) && ["ja", "zh", "cn"].includes(details.originalLanguage)));
+
+// ---- Requests and limits
+const requestCandidate = (req) => req.candidates[req.pick];
+const requestTitle = (req) => {
+  const c = requestCandidate(req);
+  return `${c.title}${c.year ? ` (${c.year})` : ""}`;
+};
+const postName = (req) => `${requestTitle(req)}${req.type === "tv" ? ` · ${seasonLabel(req.seasons)}` : ""}`.slice(0, 100);
+const requestPeople = (req) => [req.by, ...req.viewers];
+const pingPeople = (req) => ({ content: requestPeople(req).map((id) => `<@${id}>`).join(" "), allowedMentions: { users: requestPeople(req) } });
+
+function requestsThisWeek(userId) {
+  const since = Date.now() - 7 * 86400_000;
+  return Object.values(media.requests).filter((r) => r.by === userId && r.confirmedAt > since && r.status !== "declined")
+    .map((r) => r.confirmedAt).sort((a, b) => a - b);
+}
+function weeklyLimitMessage(userId) {
+  const used = requestsThisWeek(userId);
+  if (used.length < MEDIA_PER_WEEK) return null;
+  return `You've used your ${MEDIA_PER_WEEK} requests this week. The next one frees up <t:${Math.ceil((used[0] + 7 * 86400_000) / 1000)}:R>. You can still press **Me too** on other people's posts.`;
+}
+
+// Another open request for the same film, or for overlapping seasons of the same show.
+function findDuplicate(type, tmdbId, seasons, exceptPostId) {
+  return Object.values(media.requests).find((r) => r.postId !== exceptPostId && OPEN_STATUSES.includes(r.status) &&
+    r.type === type && r.tmdbId === tmdbId &&
+    (type === "movie" || r.seasons === "all" || seasons === "all" || r.seasons.some((n) => seasons.includes(n))));
+}
+
+// ---- The post
+function requestPost(req, { withImage = false } = {}) {
+  const c = requestCandidate(req);
+  const status = MEDIA_STATUS[req.status];
+  const embed = new EmbedBuilder()
+    .setTitle(requestTitle(req).slice(0, 256))
+    .setURL(`https://www.themoviedb.org/${req.type}/${c.id}`)
+    .setColor(status.colour)
+    .setFooter({ text: req.status === "downloading" ? `Downloading: ${req.progress ?? 0}%` : status.footer });
+  if (c.overview) embed.setDescription(c.overview.length > 300 ? `${c.overview.slice(0, 297)}…` : c.overview);
+  if (c.poster) embed.setThumbnail(`${TMDB_IMAGES}w342${c.poster}`);
+  embed.addFields({ name: "Type", value: req.type === "tv" ? "Show" : "Film", inline: true });
+  if (req.type === "tv") embed.addFields({ name: "Seasons", value: seasonLabel(req.seasons), inline: true });
+  if (req.viewers.length) embed.addFields({ name: "Also wants it", value: String(req.viewers.length), inline: true });
+
+  const button = (action, label, style, emoji) => new ButtonBuilder().setCustomId(`media:${action}:${req.postId ?? "new"}`).setLabel(label).setStyle(style).setEmoji(emoji);
+  const buttons = {
+    matching: [button("yes", "That's it", ButtonStyle.Success, "✅"), button("no", "Not this one", ButtonStyle.Secondary, "🔄")],
+    requested: [button("approve", "Approve", ButtonStyle.Success, "✅"), button("decline", "Decline", ButtonStyle.Danger, "❌"), button("metoo", "Me too", ButtonStyle.Secondary, "🙋")],
+    approved: [button("metoo", "Me too", ButtonStyle.Secondary, "🙋")],
+    downloading: [button("metoo", "Me too", ButtonStyle.Secondary, "🙋")],
+    ready: [button("link", "Get my watch link", ButtonStyle.Primary, "🔗"), button("metoo", "Me too", ButtonStyle.Secondary, "🙋")],
+  }[req.status] ?? [];
+
+  // The forum's gallery picture comes from the post's attachment, so the wide backdrop is attached (it has no title
+  // text and crops well); the poster goes in the card.
+  const art = c.backdrop ? `${TMDB_IMAGES}w1280${c.backdrop}` : c.poster ? `${TMDB_IMAGES}w780${c.poster}` : null;
+  return {
+    content: `Requested by <@${req.by}>${req.notes ? `\n> ${req.notes.replace(/\n/g, "\n> ")}` : ""}`.slice(0, 2000),
+    embeds: [embed],
+    components: buttons.length ? [new ActionRowBuilder().addComponents(buttons)] : [],
+    ...(withImage ? { files: art ? [{ attachment: art, name: "art.jpg" }] : [] } : {}),
+    allowedMentions: { parse: [] },
+  };
+}
+
+// Brings the post in line with the request: first message, status tag and title.
+async function renderRequest(req, { newImage = false } = {}) {
+  const thread = await discord.channels.fetch(req.postId).catch(() => null);
+  if (!thread) return null;
+  if (thread.archived) await thread.setArchived(false, "Updating a request").catch(() => {});
+  const starter = await thread.fetchStarterMessage();
+  await starter.edit({ ...requestPost(req, { withImage: newImage }), ...(newImage ? { attachments: [] } : {}) });
+  const tag = thread.parent?.availableTags.find((t) => t.name === MEDIA_STATUS[req.status].tag);
+  const tags = tag ? [tag.id] : [];
+  if (String(thread.appliedTags) !== String(tags)) await thread.setAppliedTags(tags).catch((e) => console.error("Couldn't set request tag:", e.message));
+  if (thread.name !== postName(req)) await thread.setName(postName(req)).catch(() => {});
+  return thread;
+}
+
+async function closeRequestPost(thread) {
+  await thread?.edit({ locked: true, archived: true }).catch((e) => console.error("Couldn't close request post:", e.message));
+}
+
+// The pinned how-to with the button, in the requests channel. Made once, and updated if the text changes.
+async function ensureRequestPanel() {
+  const channel = await discord.channels.fetch(MEDIA_REQUESTS_CHANNEL_ID);
+  const payload = {
+    content: PANEL_TEXT(),
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("media:new").setLabel("Make a request").setEmoji("🎬").setStyle(ButtonStyle.Primary))],
+    allowedMentions: { parse: [] },
+  };
+  const recent = await channel.messages.fetch({ limit: 20 });
+  const panel = recent.find((m) => m.author.id === discord.user.id && m.components[0]?.components.some((c) => c.customId === "media:new"));
+  if (panel) {
+    if (panel.content !== payload.content) await panel.edit(payload);
+    return;
+  }
+  const sent = await channel.send(payload);
+  await sent.pin().catch(() => {});
+  // Remove the "pinned a message" notice so the panel is the only thing in the channel.
+  const notice = (await channel.messages.fetch({ limit: 5 })).find((m) => m.type === 6 && m.author.id === discord.user.id);
+  await notice?.delete().catch(() => {});
+}
+
+// ---- Form
+const isMemberish = (member) => isMember(member) || isStaff(member);
+
+async function openRequestForm(interaction) {
+  if (!isMemberish(interaction.member)) return interaction.reply({ content: "Requests are for members only.", ephemeral: true });
+  const limit = weeklyLimitMessage(interaction.user.id);
+  if (limit) return interaction.reply({ content: limit, ephemeral: true });
+  const text = (id, style, max, required) => new TextInputBuilder().setCustomId(id).setStyle(style).setMaxLength(max).setRequired(required);
+  const modal = new ModalBuilder().setCustomId("media:form").setTitle("Request a film or show").addLabelComponents(
+    new LabelBuilder().setLabel("Title").setDescription("e.g. The Bear, F1, Spirited Away").setTextInputComponent(text("title", TextInputStyle.Short, 100, true)),
+    new LabelBuilder().setLabel("Film or show?").setStringSelectMenuComponent(new StringSelectMenuBuilder().setCustomId("type").setRequired(true)
+      .addOptions({ label: "Film", value: "movie", emoji: "🎬" }, { label: "Show", value: "tv", emoji: "📺" })),
+    new LabelBuilder().setLabel("Season(s)").setDescription("Shows only: 1, 1-3 or all. Leave empty for season 1.").setTextInputComponent(text("seasons", TextInputStyle.Short, 30, false)),
+    new LabelBuilder().setLabel("Year").setDescription("Optional. Helps when there's more than one with that name.").setTextInputComponent(text("year", TextInputStyle.Short, 4, false)),
+    new LabelBuilder().setLabel("Notes").setDescription("Optional").setTextInputComponent(text("notes", TextInputStyle.Paragraph, 300, false)),
+  );
+  return interaction.showModal(modal);
+}
+
+async function submitRequestForm(interaction) {
+  await interaction.deferReply({ ephemeral: true });
+  if (!isMemberish(interaction.member)) return interaction.editReply("Requests are for members only.");
+  const limit = weeklyLimitMessage(interaction.user.id);
+  if (limit) return interaction.editReply(limit);
+
+  const title = interaction.fields.getTextInputValue("title").trim();
+  const type = interaction.fields.getStringSelectValues("type")[0] === "tv" ? "tv" : "movie";
+  const yearText = interaction.fields.getTextInputValue("year").trim();
+  const year = /^(19|20)\d\d$/.test(yearText) ? Number(yearText) : null;
+  const notes = interaction.fields.getTextInputValue("notes").trim();
+  const seasons = type === "tv" ? parseSeasons(interaction.fields.getTextInputValue("seasons")) : null;
+  if (type === "tv" && !seasons) return interaction.editReply("I couldn't read the seasons. Use something like `1`, `1-3` or `all`.");
+
+  const candidates = await findMatches(title, year, type);
+  if (!candidates.length) {
+    return interaction.editReply(`I couldn't find a ${type === "tv" ? "show" : "film"} called **${title}**. Check the spelling, or add the year.`);
+  }
+  const duplicate = findDuplicate(type, candidates[0].id, seasons);
+  if (duplicate) {
+    return interaction.editReply(`**${requestTitle(duplicate)}** has already been requested: <#${duplicate.postId}>. Press **Me too** there to get the link as well.`);
+  }
+
+  const req = { by: interaction.user.id, byName: interaction.member.displayName, type, seasons, notes, candidates, pick: 0, viewers: [], status: "matching", createdAt: Date.now() };
+  const forum = await discord.channels.fetch(MEDIA_FORUM_ID);
+  const thread = await forum.threads.create({ name: postName(req), message: requestPost(req, { withImage: true }), reason: `Media request from ${req.byName}` });
+  req.postId = thread.id;
+  media.requests[thread.id] = req;
+  saveMedia();
+  await renderRequest(req); // the buttons need the post's id, which only exists now
+  console.log(`[media] ${interaction.user.tag} asked for ${postName(req)}`);
+  return interaction.editReply(`Your request is up: ${thread.url}\nCheck it's the right one and press **That's it**.`);
+}
+
+// ---- Buttons
+async function handleMediaButton(interaction) {
+  const [, action, postId] = interaction.customId.split(":");
+  const req = media.requests[postId];
+  if (!req) return interaction.reply({ content: "This request is closed.", ephemeral: true });
+  const staff = isStaff(interaction.member);
+  const mine = interaction.user.id === req.by;
+  const reply = (content) => interaction.reply({ content, ephemeral: true });
+
+  if (action === "yes" || action === "no") {
+    if (!mine && !staff) return reply("Only the person who asked can do that.");
+    if (req.status !== "matching") return reply("That's already been confirmed.");
+    if (action === "no") {
+      if (req.pick + 1 >= req.candidates.length) {
+        await reply("That's all the matches I found. Make a new request with the year or the exact title.");
+        delete media.requests[postId];
+        saveMedia();
+        return interaction.channel?.delete("Request had no right match").catch(() => {});
+      }
+      await interaction.deferUpdate();
+      req.pick++;
+      saveMedia();
+      return renderRequest(req, { newImage: true });
+    }
+    return confirmRequest(interaction, req);
+  }
+
+  if (action === "approve" || action === "decline") {
+    if (!staff) return reply("Only staff can approve or decline requests.");
+    if (req.status !== "requested") return reply("That request has already been dealt with.");
+    await interaction.deferUpdate();
+    req.decidedBy = interaction.member.displayName;
+    req.decidedAt = Date.now();
+    const thread = interaction.channel;
+    if (action === "decline") {
+      req.status = "declined";
+      saveMedia();
+      await renderRequest(req);
+      await thread.send({ ...pingPeople(req), content: `${pingPeople(req).content} Declined by staff.` });
+      return closeRequestPost(thread);
+    }
+    try {
+      await startDownload(req);
+    } catch (error) {
+      console.error("Starting a download failed:", error.message);
+      staffAlert(`media-start-${postId}`, `⚠️ Bot problem: couldn't start **${requestTitle(req)}** (${error.message.slice(0, 200)}). ${thread.url}`, 0);
+      return interaction.followUp({ content: `That didn't work: ${error.message.slice(0, 300)}`, ephemeral: true });
+    }
+    req.status = "approved";
+    req.approvedAt = Date.now();
+    saveMedia();
+    await renderRequest(req);
+    await thread.send({ ...pingPeople(req), content: `${pingPeople(req).content} Accepted. Your watch link will be ready shortly, and you'll be notified when it is.` });
+    console.log(`[media] approved ${postName(req)} (${req.owned ? "already in the library" : req.arr?.added ? "added" : "searching"})`);
+    return checkRequest(req).catch((e) => console.error("Request check failed:", e.message));
+  }
+
+  if (action === "metoo") {
+    if (!OPEN_STATUSES.includes(req.status)) return reply("This one's finished.");
+    if (!isMemberish(interaction.member)) return reply("Requests are for members only.");
+    if (requestPeople(req).includes(interaction.user.id)) return reply("You're already on this one.");
+    req.viewers.push(interaction.user.id);
+    saveMedia();
+    await reply(req.status === "ready" ? "Added. Press **Get my watch link** to watch it." : "Added. You'll be pinged when it's ready.");
+    return renderRequest(req).catch(() => {});
+  }
+
+  if (action === "link") {
+    if (!requestPeople(req).includes(interaction.user.id) && !staff) return reply("This one isn't yours. Press **Me too** if you want it as well.");
+    if (req.status !== "ready" || !req.share || Date.now() > req.share.expiresAt) return reply("That link has expired.");
+    const until = Math.floor(req.share.expiresAt / 1000);
+    return reply(`**${requestTitle(req)}**: ${req.share.url}\nWorks until <t:${until}:f> (<t:${until}:R>). It's just for you, so don't share it.`);
+  }
+
+  if (action === "keep" || action === "delete") {
+    if (!staff) return reply("Only staff can do that.");
+    if (req.cleanup?.state !== "pending") return reply("That's already been dealt with.");
+    await interaction.deferUpdate();
+    return finishCleanup(req, action, interaction.member.displayName);
+  }
+}
+
+async function confirmRequest(interaction, req) {
+  const limit = weeklyLimitMessage(req.by);
+  if (limit) return interaction.reply({ content: limit, ephemeral: true });
+  await interaction.deferUpdate();
+  const tell = (content) => interaction.followUp({ content, ephemeral: true });
+  const c = requestCandidate(req);
+  if (req.type === "tv") {
+    // Check the seasons against what the show actually has ("all" becomes the real list, specials left out).
+    const details = await seerr(`/tv/${c.id}`);
+    const available = (details.seasons ?? []).filter((s) => s.seasonNumber > 0 && s.episodeCount > 0).map((s) => s.seasonNumber);
+    const wanted = req.seasons === "all" ? available : req.seasons.filter((n) => available.includes(n));
+    if (!wanted.length) return tell(`${c.title} doesn't have ${seasonLabel(req.seasons)}. It has ${seasonLabel(available) || "no seasons yet"}. Make a new request with the right season.`);
+    req.seasons = wanted;
+  }
+  const duplicate = findDuplicate(req.type, c.id, req.seasons, req.postId);
+  if (duplicate) {
+    await tell(`**${requestTitle(duplicate)}** has already been requested: <#${duplicate.postId}>. Press **Me too** there to get the link as well.`);
+    delete media.requests[req.postId];
+    saveMedia();
+    return interaction.channel?.delete("Duplicate request").catch(() => {});
+  }
+  req.tmdbId = c.id;
+  req.status = "requested";
+  req.confirmedAt = Date.now();
+  saveMedia();
+  const thread = await renderRequest(req);
+  staffAlert(`media-new-${req.postId}`, `🎬 **${req.byName}** requested **${postName(req)}**. Approve or decline it in the post: ${thread?.url ?? `<#${req.postId}>`}`, 0);
+}
+
+// ---- Downloading
+// Adds the film or show to Radarr/Sonarr in the hidden shared folders, unless it's already in the library.
+// Records what the bot added, because only that is ever deleted later.
+async function startDownload(req) {
+  if (req.type === "movie") {
+    const found = await shareFind(req);
+    if (found && !found.path?.startsWith(SHARED_ROOT)) { req.owned = true; return; }
+    const details = await seerr(`/movie/${req.tmdbId}`);
+    req.anime = isAnime(details);
+    const existing = (await radarr(`/movie?tmdbId=${req.tmdbId}`))[0];
+    if (existing) {
+      // Already in Radarr (wanted by someone, or another request): search for it, but it isn't this request's to delete.
+      req.arr = { id: existing.id, added: false, path: existing.path };
+      if (!existing.hasFile) await radarr("/command", { method: "POST", body: { name: "MoviesSearch", movieIds: [existing.id] } });
+      return;
+    }
+    // The same fields Seerr sends, but into the hidden shared folder.
+    const movie = await radarr("/movie", { method: "POST", body: {
+      title: details.title, year: Number(String(details.releaseDate ?? "").slice(0, 4)) || undefined, tmdbId: req.tmdbId,
+      qualityProfileId: QUALITY_PROFILE_ID, rootFolderPath: SHARED_FOLDER.movie, monitored: true, minimumAvailability: "released",
+      tags: [req.anime ? ARR_TAG.anime : ARR_TAG.regular], addOptions: { searchForMovie: true },
+    } });
+    req.arr = { id: movie.id, added: true, path: movie.path };
+    return;
+  }
+
+  const details = await seerr(`/tv/${req.tmdbId}`);
+  req.tvdbId = details.externalIds?.tvdbId ?? null;
+  req.anime = isAnime(details);
+  if (!req.tvdbId) throw new Error("this show has no TVDB id, so Sonarr can't add it");
+  const complete = (series, n) => {
+    const stats = series.seasons.find((s) => s.seasonNumber === n)?.statistics;
+    return Boolean(stats && stats.episodeCount > 0 && stats.episodeFileCount >= stats.episodeCount);
+  };
+  const existing = (await sonarr(`/series?tvdbId=${req.tvdbId}`))[0];
+  if (existing) {
+    const missing = req.seasons.filter((n) => !complete(existing, n));
+    if (!missing.length) {
+      req.owned = !existing.path.startsWith(SHARED_ROOT);
+      req.arr = { id: existing.id, added: false, addedSeasons: [], path: existing.path };
+      return;
+    }
+    // Seasons that weren't wanted before count as added by this request (so only those are ever deleted).
+    const addedSeasons = missing.filter((n) => !existing.seasons.find((s) => s.seasonNumber === n)?.monitored);
+    existing.monitored = true;
+    existing.seasons = existing.seasons.map((s) => (req.seasons.includes(s.seasonNumber) ? { ...s, monitored: true } : s));
+    await sonarr(`/series/${existing.id}`, { method: "PUT", body: existing });
+    for (const n of missing) await sonarr("/command", { method: "POST", body: { name: "SeasonSearch", seriesId: existing.id, seasonNumber: n } });
+    req.arr = { id: existing.id, added: false, addedSeasons, path: existing.path };
+    return;
+  }
+  // Not in Sonarr: it might still be in Jellyfin (added by hand).
+  const found = await shareFind(req);
+  const episodesIn = (n) => details.seasons?.find((s) => s.seasonNumber === n)?.episodeCount ?? Infinity;
+  if (found && !found.path?.startsWith(SHARED_ROOT) && req.seasons.every((n) => (found.seasons?.[n] ?? 0) >= episodesIn(n))) {
+    req.owned = true;
+    return;
+  }
+  const lookup = (await sonarr(`/series/lookup?term=${encodeURIComponent(`tvdb:${req.tvdbId}`)}`))[0];
+  if (!lookup) throw new Error("Sonarr couldn't find this show");
+  const series = await sonarr("/series", { method: "POST", body: {
+    tvdbId: req.tvdbId, title: lookup.title, qualityProfileId: QUALITY_PROFILE_ID, rootFolderPath: SHARED_FOLDER.tv, seasonFolder: true, monitored: true,
+    seriesType: req.anime ? "anime" : "standard", tags: [req.anime ? ARR_TAG.anime : ARR_TAG.regular],
+    seasons: lookup.seasons.map((s) => ({ seasonNumber: s.seasonNumber, monitored: req.seasons.includes(s.seasonNumber) })),
+    addOptions: { ignoreEpisodesWithFiles: true, searchForMissingEpisodes: true },
+  } });
+  req.arr = { id: series.id, added: true, addedSeasons: [], path: series.path };
+}
+
+// Is it in Jellyfin yet? Share searches every library, including the hidden ones.
+async function shareFind(req) {
+  for (const query of [`tmdb=${req.tmdbId}`, ...(req.tvdbId ? [`tvdb=${req.tvdbId}`] : [])]) {
+    try { return await shareApi(`/find?${query}&type=${req.type}`); } catch (error) { if (error.status !== 404) throw error; }
+  }
+  return null;
+}
+
+// Moves an approved request along: download progress, then a watch link once it's all in Jellyfin.
+async function checkRequest(req) {
+  let expected = null; // episodes per season Sonarr has, which Jellyfin must have too before the link is made
+  if (req.type === "movie" && !req.owned) {
+    const movie = await radarr(`/movie/${req.arr.id}`);
+    if (!movie.hasFile) return trackProgress(req, await radarr(`/queue/details?movieId=${req.arr.id}`));
+  }
+  if (req.type === "tv" && !req.owned && req.arr) {
+    const series = await sonarr(`/series/${req.arr.id}`);
+    const stats = (n) => series.seasons.find((s) => s.seasonNumber === n)?.statistics;
+    // Wait for whole seasons, or the link would only have the episodes downloaded so far.
+    if (!req.seasons.every((n) => stats(n)?.episodeCount > 0 && stats(n).episodeFileCount >= stats(n).episodeCount)) {
+      const queue = await sonarr(`/queue/details?seriesId=${req.arr.id}`);
+      return trackProgress(req, queue.filter((q) => req.seasons.includes(q.seasonNumber)));
+    }
+    expected = Object.fromEntries(req.seasons.map((n) => [n, stats(n).episodeFileCount]));
+  }
+  const found = await shareFind(req);
+  // Downloaded, but Jellyfin hasn't picked it all up yet.
+  if (!found || (expected && !req.seasons.every((n) => (found.seasons?.[n] ?? 0) >= expected[n]))) return noteIfStuck(req);
+  let link;
+  try {
+    link = await shareApi("/shares", { method: "POST", body: {
+      itemId: found.itemId, season: req.type === "tv" && req.seasons.length === 1 ? req.seasons[0] : null,
+      hours: MEDIA_LINK_HOURS, createdBy: discord.user.username, note: `Discord request: ${postName(req)}`,
+    } });
+  } catch (error) {
+    if (error.status === 409) return; // nothing playable yet
+    throw error;
+  }
+  req.share = { token: link.token, url: link.url, expiresAt: link.expiresAt };
+  req.status = "ready";
+  req.readyAt = Date.now();
+  saveMedia();
+  const thread = await renderRequest(req);
+  await thread?.send({ ...pingPeople(req), content: `${pingPeople(req).content} **${requestTitle(req)}** is ready. Press **Get my watch link** on the first message. The link works for ${MEDIA_LINK_HOURS} hours.` });
+  console.log(`[media] ready: ${postName(req)}`);
+}
+
+async function trackProgress(req, queue) {
+  if (queue.length) {
+    const size = queue.reduce((t, q) => t + (q.size || 0), 0);
+    const left = queue.reduce((t, q) => t + (q.sizeleft || 0), 0);
+    const pct = size ? Math.max(0, Math.min(99, Math.floor((1 - left / size) * 100))) : 0;
+    req.seenDownloading = true;
+    if (req.status !== "downloading" || Math.abs(pct - (req.progress ?? -100)) >= 10) {
+      req.status = "downloading";
+      req.progress = pct;
+      saveMedia();
+      await renderRequest(req);
+    }
+  } else if (!req.seenDownloading) {
+    noteIfStuck(req);
+  }
+}
+
+// Tells staff once if an approved request still isn't ready after a long time.
+function noteIfStuck(req) {
+  if (req.stuckAlerted || Date.now() - req.approvedAt < MEDIA_STUCK_MS) return;
+  req.stuckAlerted = true;
+  saveMedia();
+  const hint = req.seenDownloading || req.owned ? "It's downloaded but Jellyfin hasn't picked it up. A library scan might sort it."
+    : `It hasn't started downloading, so it may need searching by hand in ${req.type === "tv" ? "Sonarr" : "Radarr"}.`;
+  staffAlert(`media-stuck-${req.postId}`, `⏳ **${postName(req)}** was approved ${Math.round(MEDIA_STUCK_MS / 3600_000)} hours ago and still isn't ready. ${hint} <#${req.postId}>`, 0);
+}
+
+// ---- Expiry and cleanup
+async function expireRequest(req) {
+  req.status = "expired";
+  const needsCleanup = !req.owned && Boolean(req.arr?.added || req.arr?.addedSeasons?.length);
+  if (needsCleanup) req.cleanup = { state: "pending", deadline: Date.now() + MEDIA_CLEANUP_MS };
+  saveMedia();
+  const thread = await renderRequest(req);
+  await thread?.send({ content: "The watch link has expired.", allowedMentions: { parse: [] } }).catch(() => {});
+  await closeRequestPost(thread);
+  if (!needsCleanup || !STAFF_CHANNEL_ID) return;
+  const staffChannel = await discord.channels.fetch(STAFF_CHANNEL_ID);
+  const deadline = Math.floor(req.cleanup.deadline / 1000);
+  const sent = await staffChannel.send({
+    content: `⌛ The watch link for **${postName(req)}** (asked for by ${req.byName}) has expired. Keep it in the main library, or delete it?\n-# If nobody chooses by <t:${deadline}:f>, it's deleted. <#${req.postId}>`,
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`media:keep:${req.postId}`).setLabel("Keep").setEmoji("📥").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`media:delete:${req.postId}`).setLabel("Delete").setEmoji("🗑️").setStyle(ButtonStyle.Danger),
+    )],
+    allowedMentions: { parse: [] },
+  });
+  req.cleanup.messageId = sent.id;
+  saveMedia();
+}
+
+async function finishCleanup(req, choice, by) {
+  let outcome;
+  // Never touch something another open request is still using.
+  const other = Object.values(media.requests).find((r) => r !== req && OPEN_STATUSES.includes(r.status) && r.type === req.type && r.arr?.id === req.arr?.id);
+  try {
+    if (other) outcome = `Left as it is: <#${other.postId}> is still using it.`;
+    else outcome = choice === "keep" ? await keepDownload(req) : await deleteDownload(req);
+    req.cleanup = { ...req.cleanup, state: choice, by, at: Date.now() };
+  } catch (error) {
+    console.error("Cleanup failed:", error.message);
+    staffAlert(`media-cleanup-${req.postId}`, `⚠️ Bot problem: couldn't ${choice} **${postName(req)}** (${error.message.slice(0, 200)}).`, 0);
+    outcome = `That didn't work: ${error.message.slice(0, 200)}`;
+    req.cleanup = { ...req.cleanup, state: "failed", by, at: Date.now() };
+  }
+  saveMedia();
+  console.log(`[media] ${choice} ${postName(req)} (${by}): ${outcome}`);
+  if (!req.cleanup.messageId) return;
+  const staffChannel = await discord.channels.fetch(STAFF_CHANNEL_ID).catch(() => null);
+  const message = await staffChannel?.messages.fetch(req.cleanup.messageId).catch(() => null);
+  await message?.edit({ content: `${message.content}\n**${outcome}** (${by})`.slice(0, 2000), components: [] }).catch(() => {});
+}
+
+// Moves it out of the hidden folder into the main library, where Jellyfin and Seerr pick it up.
+async function keepDownload(req) {
+  if (!req.arr.added) return "Kept. The seasons stay with the rest of the show.";
+  if (req.type === "movie") {
+    await radarr("/movie/editor", { method: "PUT", body: { movieIds: [req.arr.id], rootFolderPath: req.anime ? LIBRARY_FOLDER.animeMovie : LIBRARY_FOLDER.movie, moveFiles: true } });
+  } else {
+    await sonarr("/series/editor", { method: "PUT", body: { seriesIds: [req.arr.id], rootFolderPath: req.anime ? LIBRARY_FOLDER.animeTv : LIBRARY_FOLDER.tv, moveFiles: true } });
+  }
+  return "Kept: moved into the main library.";
+}
+
+// Deletes only what this request added: the whole film or show if the bot added it (and it's still in the
+// shared folder), otherwise just the episode files of the seasons it asked for.
+async function deleteDownload(req) {
+  const app = req.type === "movie" ? radarr : sonarr;
+  const kind = req.type === "movie" ? "movie" : "series";
+  if (req.arr.added) {
+    const item = await app(`/${kind}/${req.arr.id}`).catch((e) => { if (e.status === 404) return null; throw e; });
+    if (!item) return "It was already gone.";
+    if (!item.path?.startsWith(SHARED_ROOT)) throw new Error("it isn't in the shared folder any more, so I left it alone");
+    await app(`/${kind}/${req.arr.id}?deleteFiles=true`, { method: "DELETE" });
+    // Clear it in Seerr too, so it doesn't show as available or processing.
+    const details = await seerr(`/${req.type}/${req.tmdbId}`).catch(() => null);
+    if (details?.mediaInfo?.id) await seerr(`/media/${details.mediaInfo.id}`, { method: "DELETE" }).catch(() => {});
+    return "Deleted.";
+  }
+  if (req.type === "movie") return "Nothing to delete: it was already in Radarr.";
+  const seasons = req.arr.addedSeasons ?? [];
+  const files = (await sonarr(`/episodefile?seriesId=${req.arr.id}`)).filter((f) => seasons.includes(f.seasonNumber));
+  if (files.length) await sonarr("/episodefile/bulk", { method: "DELETE", body: { episodeFileIds: files.map((f) => f.id) } });
+  const series = await sonarr(`/series/${req.arr.id}`);
+  series.seasons = series.seasons.map((s) => (seasons.includes(s.seasonNumber) ? { ...s, monitored: false } : s));
+  await sonarr(`/series/${req.arr.id}`, { method: "PUT", body: series });
+  return `Deleted ${seasonLabel(seasons)} (${files.length} episode${files.length === 1 ? "" : "s"}).`;
+}
+
+// On start: can the bot reach each media app with its key? Logged, and staff are told if one can't be reached.
+async function checkMediaApps() {
+  const checks = {
+    Seerr: () => seerr("/auth/me"), Radarr: () => radarr("/system/status"), Sonarr: () => sonarr("/system/status"),
+    Share: () => shareApi("/find?tmdb=x&type=movie").catch((e) => { if (e.status !== 400) throw e; }), // 400 = reached, token accepted
+  };
+  const failed = [];
+  for (const [name, check] of Object.entries(checks)) {
+    await check().catch((e) => failed.push(`${name} (${e.message.slice(0, 120)})`));
+  }
+  console.log(`[media] apps: ${failed.length ? `can't reach ${failed.join(", ")}` : "Seerr, Radarr, Sonarr and Share all OK"}`);
+  if (failed.length) staffAlert("media-apps", `⚠️ Bot problem: media requests can't reach ${failed.join(", ")}.`, 6 * 60 * 60_000);
+}
+
+// Runs every couple of minutes: downloads, link expiry, unanswered cleanups and abandoned posts.
+let checkingMedia = false;
+async function checkMediaRequests() {
+  if (checkingMedia) return;
+  checkingMedia = true;
+  try {
+    for (const req of Object.values(media.requests)) {
+      try {
+        if (req.status === "matching" && Date.now() - req.createdAt > MEDIA_DRAFT_MS) {
+          const thread = await discord.channels.fetch(req.postId).catch(() => null);
+          await thread?.delete("Request was never confirmed").catch(() => {});
+          delete media.requests[req.postId];
+          saveMedia();
+        } else if (req.status === "approved" || req.status === "downloading") {
+          await checkRequest(req);
+        } else if (req.status === "ready" && Date.now() > req.share.expiresAt) {
+          await expireRequest(req);
+        } else if (req.cleanup?.state === "pending" && Date.now() > req.cleanup.deadline) {
+          await finishCleanup(req, "delete", "nobody chose in time");
+        } else if (["declined", "expired"].includes(req.status) && req.cleanup?.state !== "pending" &&
+          Date.now() - (req.decidedAt ?? req.readyAt ?? req.createdAt) > MEDIA_FORGET_MS) {
+          delete media.requests[req.postId];
+          saveMedia();
+        }
+      } catch (error) {
+        console.error(`Media check for ${req.postId} failed:`, error.message);
+        staffAlert(`media-${req.postId}`, `⚠️ Bot problem with the **${req.candidates?.[req.pick]?.title ?? "?"}** request: ${error.message.slice(0, 200)}`, 6 * 60 * 60_000);
+      }
+    }
+  } finally {
+    checkingMedia = false;
+    writeStatus();
+  }
+}
+
+discord.on(Events.InteractionCreate, async (interaction) => {
+  if (!MEDIA_ON) return;
+  try {
+    if (interaction.isChatInputCommand() && interaction.commandName === "request") return await openRequestForm(interaction);
+    if (interaction.isButton() && interaction.customId === "media:new") return await openRequestForm(interaction);
+    if (interaction.isModalSubmit() && interaction.customId === "media:form") return await submitRequestForm(interaction);
+    if (interaction.isButton() && interaction.customId.startsWith("media:")) return await handleMediaButton(interaction);
+  } catch (error) {
+    console.error("Media request failed:", error.message);
+    staffAlert("media-error", `⚠️ Bot problem with a media request: ${error.message.slice(0, 200)}`);
+    const reply = { content: "Something went wrong with that. Staff have been told.", ephemeral: true };
+    if (interaction.deferred || interaction.replied) await interaction.followUp(reply).catch(() => {});
+    else await interaction.reply(reply).catch(() => {});
   }
 });
 
@@ -1117,6 +1867,7 @@ ${row("Search budget today", `~$${searchSpentToday.toFixed(3)} of $${SEARCH_BUDG
 ${row("Spent since restart", `~$${spentUsd.toFixed(4)}`)}
 ${row("Spent this month", `~$${monthSpend().toFixed(2)}${MONTHLY_BUDGET_USD ? ` of $${MONTHLY_BUDGET_USD} budget` : ""}`)}
 ${row("Running since", startedAt.toLocaleString("en-GB"))}
+${MEDIA_ON ? row("Media requests", `${Object.values(media.requests).filter((r) => ["requested", "approved", "downloading", "ready"].includes(r.status)).length} open`) : ""}
 ${PATCH_FEEDS.length ? row("Patch notes", `${PATCH_FEEDS.map((f) => f.name).join(", ")}; last posted: ${lastPatch || "none since restart"}`) : ""}
 ${lastError ? row("Last error", lastError) : ""}
 </table>
