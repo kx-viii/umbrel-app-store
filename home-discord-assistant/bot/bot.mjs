@@ -1081,7 +1081,7 @@ discord.on(Events.MessageCreate, async (message) => {
 // A member fills in the form (/request or the button in the requests channel). The bot finds the film or show in
 // Seerr and shows the match privately to them to confirm; then it goes to the staff channel with Approve/Decline.
 // On approval the bot adds it to Radarr/Sonarr itself, in the hidden shared folders that no Jellyfin user can see,
-// so it never shows up on anyone's TV, and posts its status in the title's post in the cinema forum (making the post
+// so it never shows up on anyone's TV, and makes sure the title has a post in the cinema forum (making one
 // if there isn't one). Once it's in Jellyfin, Share makes a 48-hour watch link, posted in that post for anyone
 // there to use. When the link expires, staff choose to keep it (moved into the main library) or
 // delete it; if nobody chooses, it's deleted. Things that were already in the library are just shared, and are
@@ -1275,14 +1275,13 @@ function joinRequest(req, userId) {
   if (!requestPeople(req).includes(userId)) {
     req.viewers.push(userId);
     saveMedia();
-    updateStatusMessage(req).catch(() => {});
   }
   if (req.status === "ready") return `**${requestName(req)}** is ready. The watch link is in <#${req.postId}>.`;
   return `**${requestName(req)}** has already been requested, so I've added you to it. You'll be pinged ${req.postId ? `in <#${req.postId}> ` : ""}when it's ready.`;
 }
 
 // ---- Cards
-// The match: shown privately to the requester to check, to staff with Approve/Decline, and as the status in the post.
+// The match: shown privately to the requester to check, and in the staff channel with Approve/Decline.
 function matchEmbed(req, { big = false } = {}) {
   const c = requestCandidate(req);
   const embed = new EmbedBuilder()
@@ -1315,9 +1314,6 @@ function matchPrompt(req) {
   };
 }
 
-// The request's message in its cinema post, edited as it moves along.
-const statusMessage = (req) => ({ content: "", embeds: [matchEmbed(req)], components: [], allowedMentions: { parse: [] } });
-
 // The ready ping in the post: who it's for, what's ready, and a Watch now button with the link.
 function readyMessage(req, until) {
   const watch = new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(req.share.url).setLabel("Watch now").setEmoji("▶️");
@@ -1328,12 +1324,13 @@ function readyMessage(req, until) {
   };
 }
 
-async function updateStatusMessage(req) {
-  if (!req.postId || !req.statusMessageId) return null;
+// The request's cinema post, unarchived so the bot can post in it. The post's opening message already shows the
+// title, so the bot only posts there when it's ready.
+async function openPost(req) {
+  if (!req.postId) return null;
   const thread = await discord.channels.fetch(req.postId).catch(() => null);
   if (!thread) return null;
-  if (thread.archived) await thread.setArchived(false, "Updating a request").catch(() => {});
-  await thread.messages.edit(req.statusMessageId, statusMessage(req)).catch((e) => console.error("Couldn't update request status:", e.message));
+  if (thread.archived) await thread.setArchived(false, "Posting a watch link").catch(() => {});
   return thread;
 }
 
@@ -1497,7 +1494,6 @@ async function handleMediaButton(interaction) {
     req.decidedAt = req.approvedAt = Date.now();
     const thread = await findOrCreateCinemaPost(req);
     req.postId = thread.id;
-    req.statusMessageId = (await thread.send(statusMessage(req))).id;
     saveMedia();
     await closeCard(`✅ Approved by ${by}: ${thread.url}`);
     console.log(`[media] approved ${requestName(req)} (${req.owned ? "already in the library" : req.arr?.added ? "added" : "searching"})`);
@@ -1665,7 +1661,7 @@ async function checkRequest(req) {
   req.status = "ready";
   req.readyAt = Date.now();
   saveMedia();
-  const thread = await updateStatusMessage(req);
+  const thread = await openPost(req);
   const until = Math.floor(req.share.expiresAt / 1000);
   const sent = await thread?.send(readyMessage(req, until));
   if (sent) { req.linkMessageId = sent.id; saveMedia(); }
@@ -1682,7 +1678,6 @@ async function trackProgress(req, queue) {
       req.status = "downloading";
       req.progress = pct;
       saveMedia();
-      await updateStatusMessage(req);
     }
   } else if (!req.seenDownloading) {
     noteIfStuck(req);
@@ -1705,7 +1700,7 @@ async function expireRequest(req) {
   const needsCleanup = !req.owned && Boolean(req.arr?.added || req.arr?.addedSeasons?.length);
   if (needsCleanup) req.cleanup = { state: "pending", deadline: Date.now() + MEDIA_CLEANUP_MS };
   saveMedia();
-  const thread = await updateStatusMessage(req); // the post is the title's general post, so it stays open
+  const thread = await openPost(req); // the post is the title's general post, so it stays open
   if (thread && req.linkMessageId) {
     await thread.messages.edit(req.linkMessageId, { content: `**${readyName(req)}**: the watch link has expired.`, components: [], allowedMentions: { parse: [] } })
       .catch((e) => console.error("Couldn't edit the expired link:", e.message));
