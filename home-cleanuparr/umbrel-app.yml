@@ -1,0 +1,44 @@
+manifestVersion: 1.1
+id: home-cleanuparr
+category: media
+name: Cleanuparr
+version: "2.10.10"
+tagline: Removes fake, stuck and malware downloads from Sonarr and Radarr
+icon: https://raw.githubusercontent.com/kx-viii/umbrel-app-store/main/home-cleanuparr/icon.png
+description: >-
+  Cleanuparr watches the download queues of Sonarr and Radarr and your torrent client, and cleans up the downloads
+  that would otherwise sit there forever: fake releases that only contain an .exe, downloads that fail to import,
+  stalled or very slow torrents, and files matching known malware patterns. Bad releases are removed, blocklisted
+  in Sonarr or Radarr so they aren't grabbed again, and a new search is started.
+
+
+  It can also send a notification when it removes something (Discord, Telegram, ntfy, Pushover, Gotify, Apprise
+  or Notifiarr).
+
+
+  🛠️ SET-UP INSTRUCTIONS
+
+
+  1. Open the app and create your Cleanuparr account (it has its own login).
+
+  2. Under Settings, add Sonarr (http://sonarr_server_1:8989) and Radarr (http://radarr_server_1:7878) with their
+  API keys, and your torrent client (for qBittorrent VPN: http://home-qbittorrent-vpn_gluetun_1:8080).
+
+  3. Turn on the Queue Cleaner (set Failed Import Max Strikes) and the Malware Blocker.
+
+
+  The web interface is also served on port 11011 of the Umbrel, behind Cleanuparr's own login.
+releaseNotes: "First version, Cleanuparr 2.10.10."
+developer: Cleanuparr
+website: https://github.com/Cleanuparr/Cleanuparr
+dependencies: []
+repo: https://github.com/Cleanuparr/Cleanuparr
+support: https://github.com/kx-viii/umbrel-app-store/issues
+port: 8487
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+torOnly: false
+submitter: home
+submission: ""
