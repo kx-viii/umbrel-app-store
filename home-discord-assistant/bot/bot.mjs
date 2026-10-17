@@ -16,8 +16,8 @@
 //   MONTHLY_BUDGET_USD                     staff are warned at 50%, 80% and 100% of this estimated monthly spend
 //   ROOMS_CATEGORY_ID, MEMBER_ROLE_IDS     game rooms: the category temporary voice rooms go in, and the
 //                                          role ids (comma-separated) allowed to ask for one
-//   MEDIA_REQUESTS_CHANNEL_ID, MEDIA_FORUM_ID   film/show requests: the channel with the request button, and the
-//                                          forum each request gets a post in (members = MEMBER_ROLE_IDS)
+//   MEDIA_REQUESTS_CHANNEL_ID              film/show requests: the channel with the request button; each ready request
+//                                          gets a private voice channel in the same category (members = MEMBER_ROLE_IDS)
 //   SEERR_URL/_API_KEY, RADARR_URL/_API_KEY, SONARR_URL/_API_KEY, SHARE_URL, SHARE_TOKEN   the media apps they use
 // Run with: npm start
 
@@ -37,7 +37,9 @@ for (const file of [path.join(here, ".env"), path.join(here, "..", "connector", 
 }
 
 // ---- Settings ---------------------------------------------------------------
-const MODEL = process.env.MODEL || "claude-haiku-5-5";
+const MODEL = process.env.MODEL || "claude-sonnet-5-5";
+// "claude-sonnet-5-5" -> "Claude Sonnet 5.5", so the bot can say which model it runs on.
+const MODEL_NAME = MODEL.replace(/^claude-([a-z]+)-(.+)$/, (_, family, version) => `Claude ${family[0].toUpperCase()}${family.slice(1)} ${version.replace(/-/g, ".")}`);
 const ASK_CHANNEL_ID = process.env.ASK_CHANNEL_ID || "";
 const SERVER_INFO = process.env.SERVER_INFO || "";
 const OWNER_NAME = process.env.OWNER_NAME || "the server owner";
@@ -139,14 +141,13 @@ const UPDATE_TOOL = {
 };
 const UPDATE_ON = `\n- This person helps run the server. If they ask to post a server update or changelog, call post_server_update with their notes.`;
 // Media requests: members ask for a film or show with a form; it's approved in the staff channel, downloads into the
-// hidden shared folders, and the watch link is posted in the title's post in the cinema forum.
+// hidden shared folders, and the watch link is posted in a private voice channel made for the people who asked.
 const MEDIA_REQUESTS_CHANNEL_ID = process.env.MEDIA_REQUESTS_CHANNEL_ID || "";
-const MEDIA_FORUM_ID = process.env.MEDIA_FORUM_ID || "";
 const SEERR_URL = (process.env.SEERR_URL || "").replace(/\/+$/, "");
 const RADARR_URL = (process.env.RADARR_URL || "").replace(/\/+$/, "");
 const SONARR_URL = (process.env.SONARR_URL || "").replace(/\/+$/, "");
 const SHARE_URL = (process.env.SHARE_URL || "").replace(/\/+$/, "");
-const MEDIA_ON = Boolean(MEDIA_REQUESTS_CHANNEL_ID && MEDIA_FORUM_ID && SEERR_URL && process.env.SEERR_API_KEY && RADARR_URL &&
+const MEDIA_ON = Boolean(MEDIA_REQUESTS_CHANNEL_ID && SEERR_URL && process.env.SEERR_API_KEY && RADARR_URL &&
   process.env.RADARR_API_KEY && SONARR_URL && process.env.SONARR_API_KEY && SHARE_URL && process.env.SHARE_TOKEN);
 const MEDIA_HINT = `\n- If someone asks you to get, download or add a film or show, tell them to use /request or the button in <#${MEDIA_REQUESTS_CHANNEL_ID}>. You can't request it yourself.`;
 // Game tags: every post in the games forum gets a ping role; reacting with the post's title emoji
@@ -154,27 +155,27 @@ const MEDIA_HINT = `\n- If someone asks you to get, download or add a film or sh
 const GAMES_FORUM_ID = process.env.GAMES_FORUM_ID || "";
 const TAG_EMOJI = "🔔";                         // fallback when a post title has no emoji
 const TAGS_FILE = path.join(here, "tags.json"); // forum post id -> { roleId, emoji, noted, noteId }
-const MAX_TOKENS = 1200;
+const MAX_TOKENS = 1600;
 const HISTORY_MESSAGES = 10;    // recent channel messages sent as context
 const USER_COOLDOWN_MS = 15_000; // per person, between questions
-const DAILY_LIMIT = 200;         // questions per day across the whole server
+const DAILY_LIMIT = 40;          // questions per day across the whole server
 // Web research: up to 3 searches and 2 page fetches per question, paid from a daily budget.
 const SEARCH_BUDGET_USD = 0.15;  // per day, across the whole server (worst case ~$4.50/month)
 const RESEARCH_PER_PERSON = 3;   // researched questions per person per day
 const RESEARCH_TOOLS = [
-  { type: "web_search_20250305", name: "web_search", max_uses: 3 }, // the dynamic-filtering version doesn't run on Haiku 5.5
+  { type: "web_search_20250305", name: "web_search", max_uses: 3 }, // basic version; the dynamic-filtering one also works on Sonnet 5.5
   { type: "web_fetch_20250910", name: "web_fetch", max_uses: 2, max_content_tokens: 4000 },
 ];
-// Haiku 5.5 prices in USD (only used for the running cost estimate and the search budget).
-const PRICE_IN = 0.10 / 1e6;
-const PRICE_OUT = 0.50 / 1e6;
+// Sonnet 5.5 prices in USD (only used for the running cost estimate and the search budget).
+const PRICE_IN = 2.00 / 1e6;
+const PRICE_OUT = 10.00 / 1e6;
 const PRICE_SEARCH = 0.01;
 
 const SEARCH_ON = `\n- You can research online: up to 3 web searches, and you can open up to 2 pages with web_fetch to check a source (such as the official site, patch notes or a channel page). Only do this when the answer depends on recent or changing information (patch notes, release dates, news, results, new uploads, prices) and you aren't confident without it; otherwise answer from what you know. Prefer primary sources. Stop as soon as you have the answer.`;
 const SEARCH_OFF = `\n- Web search isn't available right now (today's search limit is used up). If the question needs current information, answer from what you know and say you couldn't check online today.`;
 
 function systemPrompt(botName, serverName, canSearch) {
-  return `You are ${botName}, the assistant in the Discord server "${serverName}".
+  return `You are ${botName}, the assistant in the Discord server "${serverName}". You run on ${MODEL_NAME}, made by Anthropic; say so if asked which model or AI you are.
 ${SERVER_INFO ? `\nAbout this server: ${SERVER_INFO}\n` : ""}
 How to reply:
 - This is Discord chat. How to talk: ${PERSONALITY}
@@ -433,7 +434,7 @@ async function steamArt(game) {
 // Writes the new opening text for a game post from the request, keeping the same layout.
 async function draftPostText(game, emoji, details, currentText) {
   const response = await anthropic.messages.create({
-    model: MODEL, max_tokens: 800, output_config: { effort: "low" },
+    model: MODEL, max_tokens: 1200, output_config: { effort: "low" },
     system: "You write the opening message of a game's post in a Discord games forum. Plain, direct British English. Format: a '# <emoji> <Game>' heading, then the key facts in bold labels (e.g. **IP:**, **Password:**, **Modpack:**), then a short numbered 'How to join' list if there are steps. Only include facts you're given; never invent IPs, passwords or links. No closing remarks. Reply with the message text only.",
     messages: [{ role: "user", content: currentText
       ? `Update this post with the change below. Keep everything else the same.\n\nChange: ${details}\n\nCurrent post:\n${currentText}`
@@ -552,7 +553,7 @@ async function draftServerUpdate(notes, bump, by) {
   const updates = loadUpdates();
   const version = nextVersion(updates.version, bump);
   const response = await anthropic.messages.create({
-    model: MODEL, max_tokens: 900, output_config: { effort: "low" },
+    model: MODEL, max_tokens: 1300, output_config: { effort: "low" },
     system: "You write short server update posts for a Discord server, in plain, direct British English. Format:\n" +
       `## v${version}: <a short title>\n` +
       "**What's new**\n- one line per change, biggest first\n" +
@@ -928,7 +929,7 @@ async function handlePatchItem(feed, item, covers = new Map()) {
   const text = item.contents.replace(/\[\/?(p|b|i|u|h\d|list|olist|\*|url[^\]]*|img[^\]]*|previewyoutube[^\]]*|table|tr|td|th|hr)\]/gi, " ").replace(/\{STEAM_CLAN_IMAGE\}[^\s]*/g, "").replace(/\s+/g, " ").trim();
   const response = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 800,
+    max_tokens: 1200,
     output_config: { effort: "low" },
     system: "You summarise official game announcements for a Discord gaming chat, in British English.\n" +
       "If the announcement contains actual game changes (patch notes, fixes, balance changes, new content, matchmaking changes or tests), reply with one short overview sentence, then up to 6 bullet points ('- ') with the most important changes. No heading, no preamble, under 900 characters.\n" +
@@ -1081,12 +1082,12 @@ discord.on(Events.MessageCreate, async (message) => {
 // A member fills in the form (/request or the button in the requests channel). The bot finds the film or show in
 // Seerr and shows the match privately to them to confirm; then it goes to the staff channel with Approve/Decline.
 // On approval the bot adds it to Radarr/Sonarr itself, in the hidden shared folders that no Jellyfin user can see,
-// so it never shows up on anyone's TV, and makes sure the title has a post in the cinema forum (making one
-// if there isn't one). Once it's in Jellyfin, Share makes a 48-hour watch link, posted in that post for anyone
-// there to use. When the link expires, staff choose to keep it (moved into the main library) or
-// delete it; if nobody chooses, it's deleted. Things that were already in the library are just shared, and are
-// never deleted.
-const MEDIA_FILE = path.join(here, "media.json"); // { requests: { id: {...} }, posts: { "tv:<tmdb>:<seasons>": postId } }
+// so it never shows up on anyone's TV. Once it's in Jellyfin, Share makes a 48-hour watch link and the bot opens
+// a private voice channel in the requests channel's category, visible only to the people who asked and the
+// server owner, with the details and the link in its chat. When the link expires the channel is deleted,
+// and staff choose to keep the download (moved into the main library) or delete it; if nobody chooses, it's
+// deleted. Things that were already in the library are just shared, and are never deleted.
+const MEDIA_FILE = path.join(here, "media.json"); // { requests: { id: {...} } }
 const MEDIA_PER_WEEK = 3;                         // confirmed requests per person per 7 days (joining someone else's is free)
 const MEDIA_LINK_HOURS = 48;
 const MEDIA_CHECK_MS = 2 * 60_000;                // how often downloads and link expiry are checked
@@ -1118,7 +1119,7 @@ Press **Make a request** or use \`/request\`.
 **Season(s):** shows only, e.g. \`1\`, \`1-3\` or \`all\`. Leave it empty for season 1.
 
 - Check the match and press **That's it**.
-- Once it's approved, it gets a post in <#${MEDIA_FORUM_ID}>. You're pinged there with a watch link when it's ready. Links last ${MEDIA_LINK_HOURS} hours.
+- When it's ready, you get a private voice channel here with the watch link in its chat, and you're pinged there. Links last ${MEDIA_LINK_HOURS} hours, then the channel closes.
 - If someone has already asked for it, you're added to theirs instead.`;
 
 function loadMedia() {
@@ -1198,7 +1199,7 @@ async function pickMatchWithClaude(title, year, type, list) {
   const options = list.map((c, i) => `${i}. ${c.title}${c.year ? ` (${c.year})` : ""}: ${c.overview.slice(0, 150)}`).join("\n");
   try {
     const response = await anthropic.messages.create({
-      model: MODEL, max_tokens: 200, output_config: { effort: "low" },
+      model: MODEL, max_tokens: 600, output_config: { effort: "low" },
       system: "You match a member's film or TV request to a search result. Reply with JSON only: {\"index\": <number of the result they mean, or -1 if none fit>, \"search\": \"<if none fit, the official title to search for instead; otherwise empty>\"}",
       messages: [{ role: "user", content: `They asked for a ${kind}: "${title}"${year ? ` from ${year}` : ""}.\n\nSearch results:\n${options || "(none)"}` }],
     });
@@ -1270,14 +1271,20 @@ function findDuplicate(type, tmdbId, seasons, exceptId) {
     (type === "movie" || r.seasons === "all" || seasons === "all" || r.seasons.some((n) => seasons.includes(n))));
 }
 
-// Adds someone to an existing request (free), and says where they'll hear about it.
-function joinRequest(req, userId) {
+// Adds someone to an existing request (free), and says where they'll hear about it. If its watch channel is
+// already open, they're let into it and pinged there.
+async function joinRequest(req, userId) {
   if (!requestPeople(req).includes(userId)) {
     req.viewers.push(userId);
     saveMedia();
+    const room = req.roomId ? await discord.channels.fetch(req.roomId).catch(() => null) : null;
+    if (room) {
+      await room.permissionOverwrites.create(userId, ROOM_ALLOW, { type: OverwriteType.Member, reason: "Joined a media request" });
+      await room.send({ content: `<@${userId}> you've been added, the watch link is at the top of this chat 👆`, allowedMentions: { users: [userId] } }).catch(() => {});
+    }
   }
-  if (req.status === "ready") return `**${requestName(req)}** is ready. The watch link is in <#${req.postId}>.`;
-  return `**${requestName(req)}** has already been requested, so I've added you to it. You'll be pinged ${req.postId ? `in <#${req.postId}> ` : ""}when it's ready.`;
+  if (req.status === "ready" && req.roomId) return `**${requestName(req)}** is ready. The watch link is in <#${req.roomId}>.`;
+  return `**${requestName(req)}** has already been requested, so I've added you to it. You'll get a watch channel and a ping when it's ready.`;
 }
 
 // ---- Cards
@@ -1314,67 +1321,54 @@ function matchPrompt(req) {
   };
 }
 
-// The ready ping in the post: who it's for, what's ready, and a Watch now button with the link.
+// The ready message in the watch channel's chat: who it's for, the art and details, and a Watch now button.
 function readyMessage(req, until) {
   const watch = new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(req.share.url).setLabel("Watch now").setEmoji("▶️");
   return {
-    content: `${pingPeople(req).content} **${readyName(req)}** is ready to watch 🍿\n-# The link expires <t:${until}:R>.`,
+    content: `${pingPeople(req).content} **${readyName(req)}** is ready to watch 🍿\n-# The link expires <t:${until}:R>, and this channel closes then.`,
+    embeds: [matchEmbed(req, { big: true })],
     components: buttonRow(watch),
     allowedMentions: pingPeople(req).allowedMentions,
   };
 }
 
-// The request's cinema post, unarchived so the bot can post in it. The post's opening message already shows the
-// title, so the bot only posts there when it's ready.
-async function openPost(req) {
-  if (!req.postId) return null;
-  const thread = await discord.channels.fetch(req.postId).catch(() => null);
-  if (!thread) return null;
-  if (thread.archived) await thread.setArchived(false, "Posting a watch link").catch(() => {});
-  return thread;
+// ---- Watch channels
+// What's ready: films "Title (year)", shows "Title S3–5".
+const readyName = (req) => {
+  const c = requestCandidate(req);
+  return req.type === "tv" ? `${c.title} ${seasonLabel(req.seasons)}` : `${c.title}${c.year ? ` (${c.year})` : ""}`;
+};
+const ROOM_ALLOW = { ViewChannel: true, Connect: true, Speak: true, Stream: true, SendMessages: true, ReadMessageHistory: true };
+
+// A private voice channel for the request, in the same category as the requests channel. Only the people who
+// asked, the server owner and the bot can see it.
+async function createWatchRoom(req) {
+  const requests = await discord.channels.fetch(MEDIA_REQUESTS_CHANNEL_ID);
+  const guild = requests.guild;
+  const view = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.Connect;
+  const people = [...new Set([...requestPeople(req), guild.ownerId])];
+  return guild.channels.create({
+    name: `🍿┃${readyName(req)}`.slice(0, 100),
+    type: ChannelType.GuildVoice,
+    parent: requests.parentId,
+    permissionOverwrites: [
+      { id: guild.roles.everyone.id, type: OverwriteType.Role, deny: view },
+      ...people.map((id) => ({ id, type: OverwriteType.Member, allow: Object.keys(ROOM_ALLOW).map((p) => PermissionFlagsBits[p]) })),
+      { id: discord.user.id, type: OverwriteType.Member, allow: [view, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels] },
+    ],
+    reason: `Watch channel for ${requestName(req)}`,
+  });
 }
 
-// ---- Cinema posts
-// One post per title: films are "Title (year)", shows just "Title", so every season of a show shares a post.
-const cinemaPostName = (req) => {
-  const c = requestCandidate(req);
-  return (req.type === "tv" ? c.title : `${c.title}${c.year ? ` (${c.year})` : ""}`).slice(0, 100);
-};
-// What's ready, as said in the post: the post's name plus the seasons, like "The Bear S3–5".
-const readyName = (req) => `${cinemaPostName(req)}${req.type === "tv" ? ` ${seasonLabel(req.seasons)}` : ""}`;
-
-// The title's post in the cinema forum: the one the bot made before, one someone made by hand with the same name,
-// or a new one with the art and the right tv/film/anime tag.
-async function findOrCreateCinemaPost(req) {
-  media.posts ??= {};
-  const key = `${req.type}:${req.tmdbId}`;
-  const known = media.posts[key] ? await discord.channels.fetch(media.posts[key]).catch(() => null) : null;
-  if (known) return known;
-
-  const forum = await discord.channels.fetch(MEDIA_FORUM_ID);
-  const c = requestCandidate(req);
-  const [active, archived] = await Promise.all([forum.threads.fetchActive(), forum.threads.fetchArchived({ limit: 100 })]);
-  const threads = [...active.threads.values(), ...archived.threads.values()].filter((t) => t.parentId === forum.id);
-  const names = [cinemaPostName(req), c.title, `${c.title}${c.year ? ` (${c.year})` : ""}`].map(normTitle);
-  let thread = threads.find((t) => names.includes(normTitle(t.name)));
-  if (!thread) {
-    const tagName = req.anime ? "anime" : req.type === "tv" ? "tv" : "film";
-    const tag = forum.availableTags.find((t) => t.name.toLowerCase() === tagName);
-    const art = c.backdrop ? `${TMDB_IMAGES}w1280${c.backdrop}` : c.poster ? `${TMDB_IMAGES}w780${c.poster}` : null;
-    thread = await forum.threads.create({
-      name: cinemaPostName(req),
-      appliedTags: tag ? [tag.id] : [],
-      message: {
-        content: `**${requestTitle(req)}**${c.overview ? `\n${c.overview}` : ""}`.slice(0, 2000),
-        files: art ? [{ attachment: art, name: "art.jpg" }] : [], // the forum's gallery picture comes from this
-        allowedMentions: { parse: [] },
-      },
-      reason: "Approved media request",
-    });
-  }
-  media.posts[key] = thread.id;
-  saveMedia();
-  return thread;
+// Requests from before watch channels had their link posted in a cinema forum post instead; on expiry that
+// message is still edited so the old button stops working.
+async function expireOldPostLink(req) {
+  if (!req.postId || !req.linkMessageId) return;
+  const thread = await discord.channels.fetch(req.postId).catch(() => null);
+  if (!thread) return;
+  if (thread.archived) await thread.setArchived(false, "Watch link expired").catch(() => {});
+  await thread.messages.edit(req.linkMessageId, { content: `**${readyName(req)}**: the watch link has expired.`, components: [], allowedMentions: { parse: [] } })
+    .catch((e) => console.error("Couldn't edit the expired link:", e.message));
 }
 
 // The how-to with the button, in the requests channel. Made once, and updated if the text changes.
@@ -1492,10 +1486,8 @@ async function handleMediaButton(interaction) {
     req.status = "approved";
     req.decidedBy = by;
     req.decidedAt = req.approvedAt = Date.now();
-    const thread = await findOrCreateCinemaPost(req);
-    req.postId = thread.id;
     saveMedia();
-    await closeCard(`✅ Approved by ${by}: ${thread.url}`);
+    await closeCard(`✅ Approved by ${by}.`);
     console.log(`[media] approved ${requestName(req)} (${req.owned ? "already in the library" : req.arr?.added ? "added" : "searching"})`);
     return checkRequest(req).catch((e) => console.error("Request check failed:", e.message));
   }
@@ -1531,7 +1523,7 @@ async function confirmRequest(interaction, req) {
   if (duplicate) {
     delete media.requests[req.id];
     saveMedia();
-    return tell(joinRequest(duplicate, req.by));
+    return tell(await joinRequest(duplicate, req.by));
   }
   if (!STAFF_CHANNEL_ID) throw new Error("STAFF_CHANNEL_ID isn't set, so nobody can approve requests");
   req.tmdbId = c.id;
@@ -1647,24 +1639,38 @@ async function checkRequest(req) {
   const found = await shareFind(req);
   // Downloaded, but Jellyfin hasn't picked it all up yet.
   if (!found || (expected && !req.seasons.every((n) => (found.seasons?.[n] ?? 0) >= expected[n]))) return noteIfStuck(req);
-  let link;
+  // The link is kept once made, so if opening the channel fails, the next check retries with the same link.
+  if (!req.share) {
+    let link;
+    try {
+      link = await shareApi("/shares", { method: "POST", body: {
+        itemId: found.itemId, season: req.type === "tv" && req.seasons.length === 1 ? req.seasons[0] : null,
+        hours: MEDIA_LINK_HOURS, createdBy: discord.user.username, note: `Discord request: ${requestName(req)}`,
+      } });
+    } catch (error) {
+      if (error.status === 409) return; // nothing playable yet
+      throw error;
+    }
+    req.share = { token: link.token, url: link.url, expiresAt: link.expiresAt };
+    saveMedia();
+  }
+  if (!req.roomId) {
+    req.roomId = (await createWatchRoom(req)).id;
+    saveMedia();
+  }
+  // Only marked ready once the message is out, so a failed send is retried on the next check.
+  const previous = req.status;
+  req.status = "ready"; // for the embed's colour and footer
   try {
-    link = await shareApi("/shares", { method: "POST", body: {
-      itemId: found.itemId, season: req.type === "tv" && req.seasons.length === 1 ? req.seasons[0] : null,
-      hours: MEDIA_LINK_HOURS, createdBy: discord.user.username, note: `Discord request: ${requestName(req)}`,
-    } });
+    // Discord doesn't allow pins in a voice channel's chat, but this is the channel's first message, so it stays on top.
+    const room = await discord.channels.fetch(req.roomId);
+    await room.send(readyMessage(req, Math.floor(req.share.expiresAt / 1000)));
   } catch (error) {
-    if (error.status === 409) return; // nothing playable yet
+    req.status = previous;
     throw error;
   }
-  req.share = { token: link.token, url: link.url, expiresAt: link.expiresAt };
-  req.status = "ready";
   req.readyAt = Date.now();
   saveMedia();
-  const thread = await openPost(req);
-  const until = Math.floor(req.share.expiresAt / 1000);
-  const sent = await thread?.send(readyMessage(req, until));
-  if (sent) { req.linkMessageId = sent.id; saveMedia(); }
   console.log(`[media] ready: ${requestName(req)}`);
 }
 
@@ -1691,7 +1697,7 @@ function noteIfStuck(req) {
   saveMedia();
   const hint = req.seenDownloading || req.owned ? "It's downloaded but Jellyfin hasn't picked it up. A library scan might sort it."
     : `It hasn't started downloading, so it may need searching by hand in ${req.type === "tv" ? "Sonarr" : "Radarr"}.`;
-  staffAlert(`media-stuck-${req.id}`, `⏳ **${requestName(req)}** was approved ${Math.round(MEDIA_STUCK_MS / 3600_000)} hours ago and still isn't ready. ${hint} <#${req.postId}>`, 0);
+  staffAlert(`media-stuck-${req.id}`, `⏳ **${requestName(req)}** was approved ${Math.round(MEDIA_STUCK_MS / 3600_000)} hours ago and still isn't ready. ${hint}`, 0);
 }
 
 // ---- Expiry and cleanup
@@ -1700,16 +1706,16 @@ async function expireRequest(req) {
   const needsCleanup = !req.owned && Boolean(req.arr?.added || req.arr?.addedSeasons?.length);
   if (needsCleanup) req.cleanup = { state: "pending", deadline: Date.now() + MEDIA_CLEANUP_MS };
   saveMedia();
-  const thread = await openPost(req); // the post is the title's general post, so it stays open
-  if (thread && req.linkMessageId) {
-    await thread.messages.edit(req.linkMessageId, { content: `**${readyName(req)}**: the watch link has expired.`, components: [], allowedMentions: { parse: [] } })
-      .catch((e) => console.error("Couldn't edit the expired link:", e.message));
+  if (req.roomId) {
+    const room = await discord.channels.fetch(req.roomId).catch(() => null);
+    await room?.delete("Watch link expired").catch((e) => console.error("Couldn't delete the watch channel:", e.message));
   }
+  await expireOldPostLink(req);
   if (!needsCleanup || !STAFF_CHANNEL_ID) return;
   const staffChannel = await discord.channels.fetch(STAFF_CHANNEL_ID);
   const deadline = Math.floor(req.cleanup.deadline / 1000);
   const sent = await staffChannel.send({
-    content: `⌛ The watch link for **${requestName(req)}** (asked for by ${req.byName}) has expired. Keep it in the main library, or delete it?\n-# If nobody chooses by <t:${deadline}:f>, it's deleted. <#${req.postId}>`,
+    content: `⌛ The watch link for **${requestName(req)}** (asked for by ${req.byName}) has expired. Keep it in the main library, or delete it?\n-# If nobody chooses by <t:${deadline}:f>, it's deleted.`,
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`media:keep:${req.id}`).setLabel("Keep").setEmoji("📥").setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId(`media:delete:${req.id}`).setLabel("Delete").setEmoji("🗑️").setStyle(ButtonStyle.Danger),
@@ -1725,7 +1731,7 @@ async function finishCleanup(req, choice, by) {
   // Never touch something another open request is still using.
   const other = Object.values(media.requests).find((r) => r !== req && OPEN_STATUSES.includes(r.status) && r.type === req.type && r.arr?.id === req.arr?.id);
   try {
-    if (other) outcome = `Left as it is: <#${other.postId}> is still using it.`;
+    if (other) outcome = `Left as it is: the **${requestName(other)}** request is still using it.`;
     else outcome = choice === "keep" ? await keepDownload(req) : await deleteDownload(req);
     req.cleanup = { ...req.cleanup, state: choice, by, at: Date.now() };
   } catch (error) {
