@@ -1294,7 +1294,7 @@ async function joinRequest(req, userId) {
       await room.send({ content: `<@${userId}> you've been added, the watch link is at the top of this chat 👆`, allowedMentions: { users: [userId] } }).catch(() => {});
     }
   }
-  if (req.status === "ready" && req.roomId) return `**${requestName(req)}** is ready. The watch link is in <#${req.roomId}>.`;
+  if (req.status === "ready" && req.roomId) return `**${readyName(req)}** is ready. The watch link is in <#${req.roomId}>.`;
   return `**${requestName(req)}** has already been requested, so I've added you to it. You'll get a watch channel and a ping when it's ready.`;
 }
 
@@ -1309,7 +1309,7 @@ function matchEmbed(req, { big = false } = {}) {
     .setFooter({ text: req.status === "downloading" ? `Downloading: ${req.progress ?? 0}%` : MEDIA_STATUS[req.status].footer });
   const overview = c.overview?.length > 300 ? `${c.overview.slice(0, 297)}…` : c.overview ?? "";
   const details = [
-    req.type === "tv" ? `Show · ${seasonLabel(req.seasons)}` : "Film",
+    req.type !== "tv" ? "Film" : req.status === "ready" ? "Show" : `Show · ${seasonLabel(req.seasons)}`, // no season label in the watch channel
     ...(req.status !== "matching" ? [`requested by <@${req.by}>`] : []),
     ...(req.viewers.length ? [`+${req.viewers.length} more`] : []),
   ].join(" · ");
@@ -1344,10 +1344,10 @@ function readyMessage(req, until) {
 }
 
 // ---- Watch channels
-// What's ready: films "Title (year)", shows "Title S3–5".
+// What's ready, as members see it: films "Title (year)", shows just "Title" (no season labels).
 const readyName = (req) => {
   const c = requestCandidate(req);
-  return req.type === "tv" ? `${c.title} ${seasonLabel(req.seasons)}` : `${c.title}${c.year ? ` (${c.year})` : ""}`;
+  return req.type === "tv" ? c.title : `${c.title}${c.year ? ` (${c.year})` : ""}`;
 };
 const ROOM_ALLOW = { ViewChannel: true, Connect: true, Speak: true, Stream: true, SendMessages: true, ReadMessageHistory: true };
 
