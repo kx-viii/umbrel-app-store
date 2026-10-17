@@ -1129,6 +1129,17 @@ const media = loadMedia(); // kept in memory and saved after every change, so th
 function saveMedia() {
   try { fs.writeFileSync(MEDIA_FILE, JSON.stringify(media, null, 2)); } catch (e) { console.error("Couldn't save media requests:", e.message); }
 }
+// Requests set up by hand go in media-import.json; they're merged in on start and the file is removed.
+const MEDIA_IMPORT_FILE = path.join(here, "media-import.json");
+try {
+  const extra = JSON.parse(fs.readFileSync(MEDIA_IMPORT_FILE, "utf8")).requests ?? {};
+  Object.assign(media.requests, extra);
+  saveMedia();
+  fs.rmSync(MEDIA_IMPORT_FILE);
+  console.log(`[media] imported ${Object.keys(extra).length} request(s)`);
+} catch (e) {
+  if (e.code !== "ENOENT") console.error("Couldn't import media requests:", e.message);
+}
 
 // One small JSON client for the media apps. Keys go in headers only, never in URLs or errors.
 async function mediaApi(base, auth, pathAndQuery, { method = "GET", body } = {}) {
