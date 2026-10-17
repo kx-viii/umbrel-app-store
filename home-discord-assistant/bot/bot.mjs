@@ -1119,7 +1119,7 @@ Press **Make a request** or use \`/request\`.
 **Season(s):** shows only, e.g. \`1\`, \`1-3\` or \`all\`. Leave it empty for season 1.
 
 - Check the match and press **That's it**.
-- When it's ready, you get a private voice channel here with the watch link in its chat, and you're pinged there. Links last ${MEDIA_LINK_HOURS} hours, then the channel closes.
+- When it's ready, you get a private 🍿 voice channel in **watch** with the watch link in its chat, and you're pinged there. Links last ${MEDIA_LINK_HOURS} hours, then the channel closes.
 - If someone has already asked for it, you're added to theirs instead.`;
 
 function loadMedia() {
