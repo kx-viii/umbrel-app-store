@@ -1309,7 +1309,7 @@ function matchEmbed(req, { big = false } = {}) {
     .setFooter({ text: req.status === "downloading" ? `Downloading: ${req.progress ?? 0}%` : MEDIA_STATUS[req.status].footer });
   const overview = c.overview?.length > 300 ? `${c.overview.slice(0, 297)}…` : c.overview ?? "";
   const details = [
-    req.type !== "tv" ? "Film" : req.status === "ready" ? "Show" : `Show · ${seasonLabel(req.seasons)}`, // no season label in the watch channel
+    req.type === "tv" ? `Show · ${seasonLabel(req.seasons)}` : "Film",
     ...(req.status !== "matching" ? [`requested by <@${req.by}>`] : []),
     ...(req.viewers.length ? [`+${req.viewers.length} more`] : []),
   ].join(" · ");
@@ -1332,12 +1332,21 @@ function matchPrompt(req) {
   };
 }
 
-// The ready message in the watch channel's chat: who it's for, the art and details, and a Watch now button.
+// In the watch channel just the title and the art, no description.
+function readyEmbed(req) {
+  const c = requestCandidate(req);
+  const embed = new EmbedBuilder().setTitle(readyName(req).slice(0, 256)).setColor(MEDIA_STATUS.ready.colour);
+  const art = c.backdrop ? `${TMDB_IMAGES}w780${c.backdrop}` : c.poster ? `${TMDB_IMAGES}w342${c.poster}` : null;
+  if (art) embed.setImage(art);
+  return embed;
+}
+
+// The ready message in the watch channel's chat: who it's for, the title and art, and a Watch now button.
 function readyMessage(req, until) {
   const watch = new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(req.share.url).setLabel("Watch now").setEmoji("▶️");
   return {
     content: `${pingPeople(req).content} **${readyName(req)}** is ready to watch 🍿\n-# The link expires <t:${until}:R>, and this channel closes then.`,
-    embeds: [matchEmbed(req, { big: true })],
+    embeds: [readyEmbed(req)],
     components: buttonRow(watch),
     allowedMentions: pingPeople(req).allowedMentions,
   };
