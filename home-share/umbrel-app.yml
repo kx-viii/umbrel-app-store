@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: home-share
 category: media
 name: Share
-version: "1.0.0"
+version: "1.0.1"
 tagline: Expiring watch links for films and shows in Jellyfin
 icon: https://raw.githubusercontent.com/kx-viii/umbrel-app-store/main/home-share/icon.svg
 description: >-
@@ -31,7 +31,7 @@ description: >-
 
   Other apps can make links through the API on http://home-share_web_1:8080/api with the token saved in
   data/api-token: POST /api/shares with {"itemId": "<Jellyfin id>", "season": 1, "hours": 48}.
-releaseNotes: "First version."
+releaseNotes: "Security update: Node.js 24.22.1 (October 2026 security releases)."
 developer: home
 website: https://github.com/kx-viii/umbrel-app-store
 dependencies:
