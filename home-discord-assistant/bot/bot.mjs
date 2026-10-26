@@ -470,6 +470,10 @@ async function submitChangeRequest(message, { kind, game, emoji, details }) {
       const starter = await post.fetchStarterMessage().catch(() => null);
       if (!starter || starter.author.id !== discord.user.id) {
         // The bot can only edit its own posts, so staff handle this one by hand.
+        if (isStaff(message.member)) {
+          await postToStaff(message, { ...request, kind: "other", status: "approved" }, details, null, BY_HAND);
+          return message.reply("I can't edit that post myself, so I've noted it in staff-chat.");
+        }
         await postToStaff(message, { ...request, kind: "other" }, details);
         return message.reply("Request sent");
       }
@@ -482,13 +486,33 @@ async function submitChangeRequest(message, { kind, game, emoji, details }) {
   } else {
     preview = details;
   }
+  // Staff don't need to approve their own requests: do it straight away and keep a record in staff-chat.
+  if (isStaff(message.member) && request.kind === "other") {
+    await postToStaff(message, { ...request, status: "approved" }, preview, null, BY_HAND);
+    return message.reply("I can't do that one myself, so I've noted it in staff-chat.");
+  }
+  if (isStaff(message.member)) {
+    let done;
+    try {
+      done = await applyRequest(message.guild, request);
+      request.status = "approved";
+    } catch (error) {
+      console.error("Applying request failed:", error.message);
+      await postToStaff(message, request, preview, image?.url);
+      return message.reply(`That didn't go through (${error.message.slice(0, 200)}), so it's in staff-chat to try again.`);
+    }
+    await postToStaff(message, request, preview, image?.url, `✅ Done: ${done}`);
+    return message.reply(done);
+  }
   await postToStaff(message, request, preview, image?.url);
   await message.reply("Request sent");
 }
 
+const BY_HAND = "📌 Needs doing by hand";
 const KIND_LABEL = { add_game: "add a game", update_game_info: "change a game's info", remove_game: "remove a game", other: "a change" };
 
-async function postToStaff(message, request, preview, imageUrl) {
+// With an outcome it's just a record of something already done, so there are no buttons.
+async function postToStaff(message, request, preview, imageUrl, outcome) {
   const staff = await discord.channels.fetch(STAFF_CHANNEL_ID);
   const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
   const row = new ActionRowBuilder().addComponents(
@@ -496,9 +520,9 @@ async function postToStaff(message, request, preview, imageUrl) {
     new ButtonBuilder().setCustomId(`req:decline:${id}`).setLabel("Decline").setEmoji("❌").setStyle(ButtonStyle.Danger),
   );
   const sent = await staff.send({
-    content: `📝 **${displayName(message)}** wants to ${KIND_LABEL[request.kind]}${request.game ? `: **${request.game}**` : ""}\n> ${request.details.replace(/\n/g, "\n> ")}\n${request.kind === "other" ? "" : `\n${preview}`}\n-# Asked in ${message.channel} · ${message.url}`.slice(0, 2000),
+    content: `📝 **${displayName(message)}** ${outcome ? "asked" : "wants"} to ${KIND_LABEL[request.kind]}${request.game ? `: **${request.game}**` : ""}\n> ${request.details.replace(/\n/g, "\n> ")}\n${request.kind === "other" ? "" : `\n${preview}`}\n-# Asked in ${message.channel} · ${message.url}${outcome ? `\n**${outcome}**` : ""}`.slice(0, 2000),
     embeds: imageUrl ? [new EmbedBuilder().setImage(imageUrl)] : [],
-    components: [row],
+    components: outcome ? [] : [row],
     allowedMentions: { parse: [] },
   });
   const requests = loadRequests();
@@ -1497,18 +1521,11 @@ async function handleMediaButton(interaction) {
       return;
     }
     try {
-      await startDownload(req);
+      await approveMedia(req, by);
     } catch (error) {
-      console.error("Starting a download failed:", error.message);
-      staffAlert(`media-start-${id}`, `⚠️ Bot problem: couldn't start **${requestName(req)}** (${error.message.slice(0, 200)}).`, 0);
       return interaction.followUp({ content: `That didn't work: ${error.message.slice(0, 300)}`, ephemeral: true });
     }
-    req.status = "approved";
-    req.decidedBy = by;
-    req.decidedAt = req.approvedAt = Date.now();
-    saveMedia();
     await closeCard(`✅ Approved by ${by}.`);
-    console.log(`[media] approved ${requestName(req)} (${req.owned ? "already in the library" : req.arr?.added ? "added" : "searching"})`);
     return checkRequest(req).catch((e) => console.error("Request check failed:", e.message));
   }
 
@@ -1520,7 +1537,24 @@ async function handleMediaButton(interaction) {
   }
 }
 
+// Starts the download and marks the request approved. Throws (after alerting staff) if it couldn't start.
+async function approveMedia(req, by) {
+  try {
+    await startDownload(req);
+  } catch (error) {
+    console.error("Starting a download failed:", error.message);
+    staffAlert(`media-start-${req.id}`, `⚠️ Bot problem: couldn't start **${requestName(req)}** (${error.message.slice(0, 200)}).`, 0);
+    throw error;
+  }
+  req.status = "approved";
+  req.decidedBy = by;
+  req.decidedAt = req.approvedAt = Date.now();
+  saveMedia();
+  console.log(`[media] approved ${requestName(req)} (${req.owned ? "already in the library" : req.arr?.added ? "added" : "searching"})`);
+}
+
 // "That's it": check the seasons, join an existing request if there is one, otherwise send it to staff.
+// Staff requests are approved straight away; the card in staff-chat is then just a record.
 async function confirmRequest(interaction, req) {
   const limit = weeklyLimitMessage(req.by);
   if (limit) return interaction.update({ content: limit, embeds: [], components: [] });
@@ -1549,17 +1583,20 @@ async function confirmRequest(interaction, req) {
   req.tmdbId = c.id;
   req.status = "requested";
   req.confirmedAt = Date.now();
+  console.log(`[media] ${req.byName} requested ${requestName(req)}`);
+  const approved = isStaff(interaction.member) && await approveMedia(req, req.byName).then(() => true, () => false);
   const staffChannel = await discord.channels.fetch(STAFF_CHANNEL_ID);
   const card = await staffChannel.send({
-    content: `🎬 **${req.byName}** requested **${requestName(req)}**`,
+    content: `🎬 **${req.byName}** requested **${requestName(req)}**${approved ? `\n**✅ Approved by ${req.byName}.**` : ""}`,
     embeds: [matchEmbed(req, { big: true })],
-    components: buttonRow(mediaButton("approve", req, "Approve", ButtonStyle.Success, "✅"), mediaButton("decline", req, "Decline", ButtonStyle.Danger, "❌")),
+    components: approved ? [] : buttonRow(mediaButton("approve", req, "Approve", ButtonStyle.Success, "✅"), mediaButton("decline", req, "Decline", ButtonStyle.Danger, "❌")),
     allowedMentions: { parse: [] },
   });
   req.staffMessageId = card.id;
   saveMedia();
-  console.log(`[media] ${req.byName} requested ${requestName(req)}`);
-  return tell(`Request sent: **${requestName(req)}**. You'll be pinged when it's ready.`);
+  if (!approved) return tell(`Request sent: **${requestName(req)}**. You'll be pinged when it's ready.`);
+  checkRequest(req).catch((e) => console.error("Request check failed:", e.message));
+  return tell(`Started: **${requestName(req)}**. You'll be pinged when it's ready.`);
 }
 
 // ---- Downloading
