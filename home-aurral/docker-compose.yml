@@ -1,0 +1,21 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: home-aurral_web_1
+      APP_PORT: 3001
+      # Aurral has its own login, so skip the Umbrel one to avoid signing in twice
+      PROXY_AUTH_ADD: "false"
+
+  web:
+    image: ghcr.io/lklynet/aurral:2.12.0@sha256:fbe71cefb016cc9bc1528cc8eafbac2d658310d95a066c3673c5760c75178a62
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/London
+    volumes:
+      - ${APP_DATA_DIR}/data:/config
+      # Same container path as Lidarr, so the file paths Lidarr reports work here unchanged
+      - ${UMBREL_ROOT}/data/storage/downloads:/downloads
+    restart: on-failure

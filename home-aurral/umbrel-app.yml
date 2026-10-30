@@ -1,0 +1,43 @@
+manifestVersion: 1.1
+id: home-aurral
+category: media
+name: Aurral
+version: "2.12.0"
+tagline: Discover new music and request it through Lidarr
+icon: https://raw.githubusercontent.com/kx-viii/umbrel-app-store/main/home-aurral/icon.svg
+description: >-
+  Aurral is a music discovery app. It recommends artists and albums from your library and listening history
+  (Last.fm or ListenBrainz), shows global trends, tags and new releases, and lets you search for anything.
+  Requested albums are sent to Lidarr, which downloads them into your music folder, so they show up in Jellyfin
+  and any Jellyfin music app.
+
+
+  🛠️ SET-UP INSTRUCTIONS
+
+
+  1. Open the app and create your Aurral admin account (it has its own login).
+
+  2. Under Settings, connect Lidarr: URL http://lidarr_server_1:8686 and Lidarr's API key
+  (Lidarr > Settings > General).
+
+  3. Optional: add a Last.fm API key and your Last.fm or ListenBrainz username for personal recommendations.
+
+
+  Your Umbrel's downloads folder is mounted at /downloads, the same path Lidarr uses, so library paths match.
+releaseNotes: "First version, Aurral 2.12.0."
+developer: lklynet
+website: https://aurral.org/
+dependencies:
+  - lidarr
+repo: https://github.com/lklynet/aurral
+support: https://github.com/kx-viii/umbrel-app-store/issues
+port: 8489
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+torOnly: false
+permissions:
+  - STORAGE_DOWNLOADS
+submitter: home
+submission: ""
